@@ -216,6 +216,73 @@ defmodule HinokiTest do
       end
     end
 
+    test "directory save preserves Hinoki metadata" do
+      train_features =
+        Nx.tensor(
+          for x <- 0..29 do
+            xf = x / 10.0
+            [xf, :math.sin(xf)]
+          end,
+          type: :f64
+        )
+
+      train_labels =
+        Nx.tensor(
+          for x <- 0..29 do
+            xf = x / 10.0
+            :math.sin(xf * 3.0)
+          end,
+          type: :f32
+        )
+
+      valid_features =
+        Nx.tensor(
+          for x <- 30..59 do
+            xf = x / 10.0
+            [xf, :math.sin(xf)]
+          end,
+          type: :f64
+        )
+
+      valid_labels = Nx.broadcast(0.0, {30})
+
+      booster =
+        Hinoki.train({train_features, train_labels},
+          valid: {valid_features, valid_labels},
+          early_stopping_rounds: 5,
+          num_iterations: 80,
+          params: [
+            objective: "regression",
+            metric: "l2",
+            learning_rate: 0.4,
+            min_data_in_leaf: 1,
+            num_leaves: 16,
+            num_threads: 1,
+            seed: 42,
+            verbose: -1
+          ]
+        )
+
+      dir = Path.join(System.tmp_dir!(), "hinoki_bundle_#{System.unique_integer([:positive])}")
+
+      try do
+        :ok = Hinoki.save(booster, dir)
+
+        assert File.regular?(Path.join(dir, "model.txt"))
+        assert File.regular?(Path.join(dir, "hinoki.json"))
+
+        loaded = Hinoki.load(dir)
+
+        assert Hinoki.best(loaded) == Hinoki.best(booster)
+        assert Hinoki.info(loaded, :evals_result) == Hinoki.info(booster, :evals_result)
+
+        assert Nx.to_flat_list(Hinoki.predict(loaded, train_features)) ==
+                 Nx.to_flat_list(Hinoki.predict(booster, train_features))
+      after
+        File.rm_rf(dir)
+      end
+    end
+
     test "dump/1 + load_string/1 round-trips" do
       {features, labels} = TestData.binary_xor_like(20)
 

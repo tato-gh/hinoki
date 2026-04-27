@@ -1,4 +1,7 @@
 defmodule Hinoki do
+  @bundle_model_filename "model.txt"
+  @bundle_metadata_filename "hinoki.json"
+
   @moduledoc """
   LightGBM bindings for Elixir.
 
@@ -118,16 +121,31 @@ defmodule Hinoki do
     decode_predictions(out_bin, nrow)
   end
 
-  @doc "Persist a booster to a file in LightGBM's text model format."
+  @doc """
+  Persist a booster.
+
+  File paths are written in LightGBM's raw text model format. Directory paths
+  are written as a Hinoki bundle with `model.txt` and `hinoki.json`, preserving
+  Hinoki metadata such as `best` and `evals_result`. When saving to a new path,
+  paths without an extension are treated as bundle directories.
+  """
   @spec save(Booster.t(), Path.t()) :: :ok
   def save(%Booster{} = booster, path) do
-    File.write!(path, dump(booster))
+    if bundle_path?(path) do
+      save_bundle(booster, path)
+    else
+      File.write!(path, dump(booster))
+    end
   end
 
   @doc "Load a booster previously written by `save/2`."
   @spec load(Path.t()) :: Booster.t()
   def load(path) do
-    path |> File.read!() |> load_string()
+    if File.dir?(path) do
+      load_bundle(path)
+    else
+      path |> File.read!() |> load_string()
+    end
   end
 
   @doc "Serialize a booster to LightGBM's text model format as a binary."
@@ -299,6 +317,59 @@ defmodule Hinoki do
       },
       evals_result: %{dataset_name => %{metric_name => scores}}
     ]
+  end
+
+  defp bundle_path?(path) do
+    File.dir?(path) or
+      (not File.exists?(path) and Path.extname(path) == "")
+  end
+
+  defp save_bundle(%Booster{} = booster, path) do
+    File.mkdir_p!(path)
+    File.write!(Path.join(path, @bundle_model_filename), dump(booster))
+
+    metadata = %{
+      "best" => encode_best(booster.best),
+      "evals_result" => booster.evals_result
+    }
+
+    File.write!(Path.join(path, @bundle_metadata_filename), :json.encode(metadata))
+  end
+
+  defp load_bundle(path) do
+    booster = Path.join(path, @bundle_model_filename) |> File.read!() |> load_string()
+
+    metadata =
+      path
+      |> Path.join(@bundle_metadata_filename)
+      |> File.read!()
+      |> :json.decode()
+
+    %Booster{
+      booster
+      | best: decode_best(Map.get(metadata, "best")),
+        evals_result: Map.get(metadata, "evals_result", %{})
+    }
+  end
+
+  defp encode_best(nil), do: nil
+
+  defp encode_best(%{iteration: iteration, score: score, metric: metric}) do
+    %{
+      "iteration" => iteration,
+      "score" => score,
+      "metric" => metric
+    }
+  end
+
+  defp decode_best(nil), do: nil
+
+  defp decode_best(%{"iteration" => iteration, "score" => score, "metric" => metric}) do
+    %{
+      iteration: iteration,
+      score: score,
+      metric: metric
+    }
   end
 
   defp to_train_payload({%Nx.Tensor{} = features, %Nx.Tensor{} = labels}, _target) do

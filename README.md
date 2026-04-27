@@ -40,7 +40,8 @@ split = Hinoki.feature_importance(booster, :split)
 Hinoki.num_features(booster)
 Hinoki.current_iteration(booster)
 Hinoki.categorical_features(booster)
-Hinoki.save(booster, "model.txt")
+Hinoki.save(booster, "path/to/model.txt")
+Hinoki.save(booster, "path/to/model_dir")
 ```
 
 Early stopping uses validation data:
@@ -56,6 +57,16 @@ booster =
 
 Hinoki.current_iteration(booster)
 Hinoki.best(booster)
+```
+
+Saving to a directory writes a Hinoki bundle: `model.txt` stores the raw
+LightGBM model and `hinoki.json` stores Hinoki metadata such as early stopping
+results. Loading the directory restores both:
+
+```elixir
+Hinoki.save(booster, "path/to/model_dir")
+loaded = Hinoki.load("path/to/model_dir")
+Hinoki.best(loaded)
 ```
 
 DataFrames work too:
