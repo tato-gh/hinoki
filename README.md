@@ -36,6 +36,7 @@ booster =
 preds = Hinoki.predict(booster, features)
 gain = Hinoki.feature_importance(booster)
 split = Hinoki.feature_importance(booster, :split)
+named_gain = Hinoki.named_feature_importance(booster, [:x1, :x2])
 
 Hinoki.num_features(booster)
 Hinoki.current_iteration(booster)

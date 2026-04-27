@@ -343,6 +343,26 @@ defmodule HinokiTest do
       assert Hinoki.info(booster, {:feature_importance, :split}) == split
     end
 
+    test "returns feature importance paired with feature names" do
+      {features, labels} = TestData.binary_xor_like()
+
+      booster =
+        Hinoki.train({features, labels},
+          num_iterations: 20,
+          params: TestData.deterministic_params()
+        )
+
+      gain = Hinoki.named_feature_importance(booster, [:left, :right])
+      split = Hinoki.named_feature_importance(booster, ["left", "right"], :split)
+
+      assert [{:left, left_gain}, {:right, right_gain}] = gain
+      assert [{"left", left_split}, {"right", right_split}] = split
+      assert is_float(left_gain)
+      assert is_float(right_gain)
+      assert is_integer(left_split)
+      assert is_integer(right_split)
+    end
+
     test "rejects unsupported info and importance types" do
       {features, labels} = TestData.binary_xor_like(10)
 
@@ -358,6 +378,10 @@ defmodule HinokiTest do
 
       assert_raise ArgumentError, ~r/expected feature importance type/, fn ->
         Hinoki.feature_importance(booster, :weight)
+      end
+
+      assert_raise ArgumentError, ~r/expected 2 feature names/, fn ->
+        Hinoki.named_feature_importance(booster, [:only_one])
       end
     end
   end

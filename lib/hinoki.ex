@@ -265,6 +265,31 @@ defmodule Hinoki do
     |> maybe_cast_importance(nx_type)
   end
 
+  @doc """
+  Return feature importance paired with caller-provided feature names.
+
+  `feature_names` must contain exactly one name per feature in the booster.
+  `type` accepts the same values as `feature_importance/2`.
+  """
+  @spec named_feature_importance(Booster.t(), Enumerable.t(), :gain | :split) :: [
+          {term(), number()}
+        ]
+  def named_feature_importance(%Booster{} = booster, feature_names, type \\ :gain) do
+    feature_names = Enum.to_list(feature_names)
+    expected = num_features(booster)
+    actual = length(feature_names)
+
+    unless actual == expected do
+      raise ArgumentError,
+            "expected #{expected} feature names, got: #{actual}"
+    end
+
+    booster
+    |> feature_importance(type)
+    |> Nx.to_flat_list()
+    |> then(&Enum.zip(feature_names, &1))
+  end
+
   # ---------- input → binary ----------
 
   defp create_dataset!(features_bin, labels_bin, nrow, ncol, params_bin, reference_ref \\ nil) do
