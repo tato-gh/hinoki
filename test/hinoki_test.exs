@@ -458,6 +458,7 @@ defmodule HinokiTest do
       result =
         Hinoki.CV.k_fold({features, labels},
           k: 3,
+          max_concurrency: 2,
           early_stopping_rounds: 5,
           num_iterations: 40,
           params: [
@@ -500,6 +501,15 @@ defmodule HinokiTest do
       assert_raise ArgumentError, ~r/expected :k/, fn ->
         Hinoki.CV.k_fold({features, labels},
           k: 1,
+          early_stopping_rounds: 2,
+          params: TestData.deterministic_params()
+        )
+      end
+
+      assert_raise ArgumentError, ~r/expected :max_concurrency/, fn ->
+        Hinoki.CV.k_fold({features, labels},
+          k: 2,
+          max_concurrency: 0,
           early_stopping_rounds: 2,
           params: TestData.deterministic_params()
         )

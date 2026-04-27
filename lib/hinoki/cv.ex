@@ -13,6 +13,7 @@ defmodule Hinoki.CV do
   ## Options
 
     * `:k` - number of folds. Defaults to `5`.
+    * `:max_concurrency` - max number of folds to run concurrently. Defaults to `1`.
     * `:early_stopping_rounds` - required.
     * `:target` - required when input is an `Explorer.DataFrame`.
     * all other options are forwarded to `Hinoki.train/2`.
@@ -38,12 +39,13 @@ defmodule Hinoki.CV do
 
     nrow = validate_tensor_input!(features, labels)
     k = validate_k!(Keyword.get(opts, :k, 5), nrow)
-    train_opts = Keyword.delete(opts, :k)
+    max_concurrency = validate_max_concurrency!(Keyword.get(opts, :max_concurrency, 1), k)
+    train_opts = opts |> Keyword.delete(:k) |> Keyword.delete(:max_concurrency)
 
     folds =
       nrow
       |> fold_indices(k)
-      |> Enum.map(fn {train_idx, valid_idx} ->
+      |> run_folds(max_concurrency, fn {train_idx, valid_idx} ->
         train_input = {take_rows(features, train_idx), take_rows(labels, train_idx)}
         valid_input = {take_rows(features, valid_idx), take_rows(labels, valid_idx)}
 
@@ -70,12 +72,13 @@ defmodule Hinoki.CV do
 
     nrow = Explorer.DataFrame.n_rows(df)
     k = validate_k!(Keyword.get(opts, :k, 5), nrow)
-    train_opts = Keyword.delete(opts, :k)
+    max_concurrency = validate_max_concurrency!(Keyword.get(opts, :max_concurrency, 1), k)
+    train_opts = opts |> Keyword.delete(:k) |> Keyword.delete(:max_concurrency)
 
     folds =
       nrow
       |> fold_ranges(k)
-      |> Enum.map(fn {offset, size} ->
+      |> run_folds(max_concurrency, fn {offset, size} ->
         train_df = dataframe_except_slice(df, offset, size, nrow)
         valid_df = Explorer.DataFrame.slice(df, offset, size)
 
@@ -107,6 +110,28 @@ defmodule Hinoki.CV do
 
   defp validate_k!(k, nrow) do
     raise ArgumentError, "expected :k to be an integer between 2 and #{nrow}, got: #{inspect(k)}"
+  end
+
+  defp validate_max_concurrency!(max_concurrency, _k)
+       when is_integer(max_concurrency) and max_concurrency >= 1 do
+    max_concurrency
+  end
+
+  defp validate_max_concurrency!(max_concurrency, _k) do
+    raise ArgumentError,
+          "expected :max_concurrency to be a positive integer, got: #{inspect(max_concurrency)}"
+  end
+
+  defp run_folds(folds, 1, fun), do: Enum.map(folds, fun)
+
+  defp run_folds(folds, max_concurrency, fun) do
+    folds
+    |> Task.async_stream(fun,
+      max_concurrency: max_concurrency,
+      ordered: true,
+      timeout: :infinity
+    )
+    |> Enum.map(fn {:ok, fold} -> fold end)
   end
 
   defp fold_indices(nrow, k) do

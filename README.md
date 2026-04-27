@@ -66,6 +66,7 @@ returns fold best results plus aggregate stats:
 ```elixir
 Hinoki.CV.k_fold({features, labels},
   k: 5,
+  max_concurrency: 5,
   early_stopping_rounds: 10,
   num_iterations: 500,
   params: [objective: "regression", metric: "l2", num_threads: 1, seed: 42]
