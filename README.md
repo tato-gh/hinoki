@@ -60,6 +60,26 @@ Hinoki.current_iteration(booster)
 Hinoki.best(booster)
 ```
 
+Cross-validation uses each fold's validation data for early stopping and
+returns fold best results plus aggregate stats:
+
+```elixir
+Hinoki.CV.k_fold({features, labels},
+  k: 5,
+  early_stopping_rounds: 10,
+  num_iterations: 500,
+  params: [objective: "regression", metric: "l2", num_threads: 1, seed: 42]
+)
+
+Hinoki.CV.k_fold(df,
+  target: :label,
+  k: 5,
+  early_stopping_rounds: 10,
+  num_iterations: 500,
+  params: [objective: "regression", metric: "l2", num_threads: 1, seed: 42]
+)
+```
+
 Saving to a directory writes a Hinoki bundle: `model.txt` stores the raw
 LightGBM model and `hinoki.json` stores Hinoki metadata such as early stopping
 results. Loading the directory restores both:

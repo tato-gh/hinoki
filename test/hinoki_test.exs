@@ -435,6 +435,130 @@ defmodule HinokiTest do
     end
   end
 
+  describe "Hinoki.CV.k_fold/2" do
+    test "runs tensor k-fold cross-validation with early stopping best results" do
+      features =
+        Nx.tensor(
+          for x <- 0..59 do
+            xf = x / 10.0
+            [xf, :math.sin(xf)]
+          end,
+          type: :f64
+        )
+
+      labels =
+        Nx.tensor(
+          for x <- 0..59 do
+            xf = x / 10.0
+            :math.sin(xf * 3.0)
+          end,
+          type: :f32
+        )
+
+      result =
+        Hinoki.CV.k_fold({features, labels},
+          k: 3,
+          early_stopping_rounds: 5,
+          num_iterations: 40,
+          params: [
+            objective: "regression",
+            metric: "l2",
+            learning_rate: 0.3,
+            min_data_in_leaf: 1,
+            num_leaves: 16,
+            num_threads: 1,
+            seed: 42,
+            verbose: -1
+          ]
+        )
+
+      assert %{folds: folds, stats: stats} = result
+      assert length(folds) == 3
+      assert Enum.all?(folds, &match?(%{iteration: _, score: _, metric: "l2"}, &1))
+      assert Enum.all?(folds, &is_integer(&1.iteration))
+      assert Enum.all?(folds, &is_float(&1.score))
+
+      assert %{
+               metric: "l2",
+               score: %{mean: score_mean, std: score_std},
+               iteration: %{mean: iteration_mean, std: iteration_std}
+             } = stats
+
+      assert is_float(score_mean)
+      assert is_float(score_std)
+      assert is_float(iteration_mean)
+      assert is_float(iteration_std)
+    end
+
+    test "requires early stopping and valid k" do
+      {features, labels} = TestData.binary_xor_like(3)
+
+      assert_raise ArgumentError, ~r/requires :early_stopping_rounds/, fn ->
+        Hinoki.CV.k_fold({features, labels}, k: 2, params: TestData.deterministic_params())
+      end
+
+      assert_raise ArgumentError, ~r/expected :k/, fn ->
+        Hinoki.CV.k_fold({features, labels},
+          k: 1,
+          early_stopping_rounds: 2,
+          params: TestData.deterministic_params()
+        )
+      end
+    end
+
+    test "runs DataFrame k-fold cross-validation with target option" do
+      df =
+        Explorer.DataFrame.new(
+          x1:
+            for x <- 0..59 do
+              x / 10.0
+            end,
+          x2:
+            for x <- 0..59 do
+              :math.sin(x / 10.0)
+            end,
+          y:
+            for x <- 0..59 do
+              :math.sin(x / 10.0 * 3.0)
+            end
+        )
+
+      result =
+        Hinoki.CV.k_fold(df,
+          target: :y,
+          k: 3,
+          early_stopping_rounds: 5,
+          num_iterations: 40,
+          params: [
+            objective: "regression",
+            metric: "l2",
+            learning_rate: 0.3,
+            min_data_in_leaf: 1,
+            num_leaves: 16,
+            num_threads: 1,
+            seed: 42,
+            verbose: -1
+          ]
+        )
+
+      assert %{folds: folds, stats: %{metric: "l2"}} = result
+      assert length(folds) == 3
+      assert Enum.all?(folds, &match?(%{iteration: _, score: _, metric: "l2"}, &1))
+    end
+
+    test "DataFrame k-fold requires target option" do
+      df = Explorer.DataFrame.new(x: [1.0, 2.0, 3.0], y: [0.0, 1.0, 0.0])
+
+      assert_raise ArgumentError, ~r/requires the :target option/, fn ->
+        Hinoki.CV.k_fold(df,
+          k: 2,
+          early_stopping_rounds: 2,
+          params: TestData.deterministic_params()
+        )
+      end
+    end
+  end
+
   describe "input validation" do
     test "labels row count must match features" do
       features = Nx.iota({10, 3}, type: :f64)
