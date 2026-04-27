@@ -39,6 +39,7 @@ split = Hinoki.feature_importance(booster, :split)
 
 Hinoki.num_features(booster)
 Hinoki.current_iteration(booster)
+Hinoki.categorical_features(booster)
 Hinoki.save(booster, "model.txt")
 ```
 
@@ -61,6 +62,12 @@ DataFrames work too:
 ```elixir
 Hinoki.train(df, target: :label, params: [objective: "regression", num_threads: 1, seed: 42])
 ```
+
+DataFrame columns with Explorer's `:category` dtype are passed to
+LightGBM as categorical features automatically. Tensor input has no
+column dtype metadata, so pass `categorical_feature` in `:params` when
+using `Nx.Tensor` features. `Hinoki.categorical_features/1` returns
+the 0-based feature indexes marked as categorical in the trained model.
 
 ## Reproducibility
 

@@ -222,6 +222,8 @@ defmodule HinokiTest do
       assert is_integer(Hinoki.num_classes(booster))
       assert Hinoki.num_classes(booster) >= 1
       assert Hinoki.current_iteration(booster) > 0
+      assert Hinoki.categorical_features(booster) == []
+      assert Hinoki.info(booster, :categorical_features) == []
     end
 
     test "returns feature importance as tensors" do
@@ -283,6 +285,34 @@ defmodule HinokiTest do
 
       preds = Hinoki.predict(booster, Explorer.DataFrame.discard(df, ["y"]))
       assert Nx.shape(preds) == {6}
+    end
+
+    test "marks category columns as LightGBM categorical features" do
+      df =
+        Explorer.DataFrame.new(
+          group:
+            Explorer.Series.from_list(
+              ["low", "low", "mid", "mid", "high", "high", "low", "high"],
+              dtype: :category
+            ),
+          x: Explorer.Series.from_list([0.1, 0.2, 1.0, 1.1, 2.0, 2.1, 0.3, 2.2]),
+          y: Explorer.Series.from_list([0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+        )
+
+      booster =
+        Hinoki.train(df,
+          target: :y,
+          num_iterations: 20,
+          params: TestData.deterministic_params()
+        )
+
+      preds = Hinoki.predict(booster, Explorer.DataFrame.discard(df, ["y"]))
+
+      assert Nx.shape(preds) == {8}
+      assert Hinoki.num_features(booster) == 2
+      assert Hinoki.categorical_features(booster) == [0]
+      assert Hinoki.info(booster, :categorical_features) == [0]
+      assert Hinoki.dump(booster) =~ "[categorical_feature: 0]"
     end
   end
 

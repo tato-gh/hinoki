@@ -48,8 +48,7 @@ defmodule Hinoki.MixProject do
       maintainers: ["tsukinolab"],
       licenses: ["Apache-2.0"],
       links: %{"GitHub" => @source_url},
-      files:
-        ~w(lib c_src Makefile mix.exs README.md LICENSE .formatter.exs)
+      files: ~w(lib c_src Makefile mix.exs README.md LICENSE .formatter.exs)
     ]
   end
 

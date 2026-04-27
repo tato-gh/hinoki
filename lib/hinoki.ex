@@ -33,7 +33,9 @@ defmodule Hinoki do
   Parameters are forwarded verbatim to LightGBM. See
   https://lightgbm.readthedocs.io/en/latest/Parameters.html for the
   full list. When deterministic results are needed, set both
-  `num_threads: 1` and a `seed`.
+  `num_threads: 1` and a `seed`. For `Explorer.DataFrame` training,
+  `:category` feature columns are forwarded to LightGBM automatically
+  unless `categorical_feature` is already present in `:params`.
   """
 
   alias Hinoki.{Booster, NIF}
@@ -67,8 +69,9 @@ defmodule Hinoki do
     target = Keyword.get(opts, :target)
     early_stopping_rounds = Keyword.get(opts, :early_stopping_rounds)
 
-    {features_bin, labels_bin, nrow, ncol} = to_train_payload(input, target)
+    {features_bin, labels_bin, nrow, ncol, categorical_indices} = to_train_payload(input, target)
     valid_payloads = to_valid_payloads(Keyword.get(opts, :valid, []), input, target, ncol)
+    params = maybe_put_categorical_feature(params, categorical_indices)
     params_bin = encode_params(params)
 
     dataset_ref = create_dataset!(features_bin, labels_bin, nrow, ncol, params_bin)
@@ -151,11 +154,12 @@ defmodule Hinoki do
     * `:num_features`
     * `:num_classes`
     * `:current_iteration`
+    * `:categorical_features`
     * `:feature_importance` — equivalent to `{:feature_importance, :gain}`
     * `{:feature_importance, :gain}`
     * `{:feature_importance, :split}`
   """
-  @spec info(Booster.t(), atom() | tuple()) :: integer() | Nx.Tensor.t()
+  @spec info(Booster.t(), atom() | tuple()) :: integer() | [non_neg_integer()] | Nx.Tensor.t()
   def info(%Booster{ref: ref}, :num_features) do
     unwrap!(NIF.booster_get_num_feature(ref))
   end
@@ -166,6 +170,10 @@ defmodule Hinoki do
 
   def info(%Booster{ref: ref}, :current_iteration) do
     unwrap!(NIF.booster_get_current_iteration(ref))
+  end
+
+  def info(%Booster{} = booster, :categorical_features) do
+    categorical_features(booster)
   end
 
   def info(%Booster{} = booster, :feature_importance) do
@@ -191,6 +199,14 @@ defmodule Hinoki do
   @doc "Return the current boosting iteration."
   @spec current_iteration(Booster.t()) :: non_neg_integer()
   def current_iteration(%Booster{} = booster), do: info(booster, :current_iteration)
+
+  @doc "Return 0-based feature indexes marked as categorical in the booster."
+  @spec categorical_features(Booster.t()) :: [non_neg_integer()]
+  def categorical_features(%Booster{} = booster) do
+    booster
+    |> dump()
+    |> parse_categorical_features()
+  end
 
   @doc """
   Return feature importance as an `Nx.Tensor`.
@@ -250,7 +266,7 @@ defmodule Hinoki do
   defp to_train_payload({%Nx.Tensor{} = features, %Nx.Tensor{} = labels}, _target) do
     {features_bin, nrow, ncol} = tensor_to_features_bin(features)
     labels_bin = labels_tensor_to_bin(labels, nrow)
-    {features_bin, labels_bin, nrow, ncol}
+    {features_bin, labels_bin, nrow, ncol, []}
   end
 
   defp to_train_payload(%Explorer.DataFrame{} = df, target)
@@ -264,6 +280,7 @@ defmodule Hinoki do
     end
 
     feature_cols = names -- [target]
+    dtypes = Explorer.DataFrame.dtypes(df)
 
     if feature_cols == [] do
       raise ArgumentError,
@@ -272,6 +289,7 @@ defmodule Hinoki do
 
     features = df_columns_to_tensor(df, feature_cols)
     {features_bin, nrow, ncol} = tensor_to_features_bin(features)
+    categorical_indices = categorical_feature_indices(feature_cols, dtypes)
 
     labels =
       df
@@ -280,7 +298,7 @@ defmodule Hinoki do
       |> Explorer.Series.to_tensor()
 
     labels_bin = labels_tensor_to_bin(labels, nrow)
-    {features_bin, labels_bin, nrow, ncol}
+    {features_bin, labels_bin, nrow, ncol, categorical_indices}
   end
 
   defp to_train_payload(%Explorer.DataFrame{}, nil) do
@@ -324,7 +342,7 @@ defmodule Hinoki do
   end
 
   defp to_valid_payload(%Explorer.DataFrame{} = df, %Explorer.DataFrame{}, target, expected_ncol) do
-    {features_bin, labels_bin, nrow, ncol} = to_train_payload(df, target)
+    {features_bin, labels_bin, nrow, ncol, _categorical_indices} = to_train_payload(df, target)
     validate_feature_count!(ncol, expected_ncol, "validation")
     {features_bin, labels_bin, nrow, ncol}
   end
@@ -357,12 +375,27 @@ defmodule Hinoki do
   defp df_columns_to_tensor(df, cols) do
     cols
     |> Enum.map(fn col ->
-      df
-      |> Explorer.DataFrame.pull(col)
-      |> Explorer.Series.cast({:f, 64})
-      |> Explorer.Series.to_tensor()
+      series = Explorer.DataFrame.pull(df, col)
+
+      if Explorer.Series.dtype(series) == :category do
+        series
+        |> Explorer.Series.to_tensor()
+        |> Nx.as_type(:f64)
+      else
+        series
+        |> Explorer.Series.cast({:f, 64})
+        |> Explorer.Series.to_tensor()
+      end
     end)
     |> Nx.stack(axis: 1)
+  end
+
+  defp categorical_feature_indices(feature_cols, dtypes) do
+    feature_cols
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {col, idx} ->
+      if Map.fetch!(dtypes, col) == :category, do: [idx], else: []
+    end)
   end
 
   defp tensor_to_features_bin(%Nx.Tensor{} = t) do
@@ -424,6 +457,28 @@ defmodule Hinoki do
   defp format_param_value(v) when is_list(v), do: Enum.map_join(v, ",", &format_param_value/1)
   defp format_param_value(v), do: to_string(v)
 
+  defp maybe_put_categorical_feature(params, []), do: params
+
+  defp maybe_put_categorical_feature(params, categorical_indices) when is_map(params) do
+    if param_has_key?(Map.to_list(params), "categorical_feature") do
+      params
+    else
+      Map.put(params, :categorical_feature, categorical_indices)
+    end
+  end
+
+  defp maybe_put_categorical_feature(params, categorical_indices) when is_list(params) do
+    if param_has_key?(params, "categorical_feature") do
+      params
+    else
+      params ++ [categorical_feature: categorical_indices]
+    end
+  end
+
+  defp param_has_key?(params, key) do
+    Enum.any?(params, fn {param_key, _value} -> to_string(param_key) == key end)
+  end
+
   defp importance_type!(:split), do: {0, :s64}
   defp importance_type!(:gain), do: {1, :f64}
 
@@ -434,6 +489,33 @@ defmodule Hinoki do
 
   defp maybe_cast_importance(tensor, :f64), do: tensor
   defp maybe_cast_importance(tensor, :s64), do: Nx.as_type(tensor, :s64)
+
+  defp parse_categorical_features(model_text) do
+    model_text
+    |> String.split("\n")
+    |> Enum.find_value([], fn
+      "[categorical_feature: " <> rest ->
+        rest
+        |> String.trim_trailing("]")
+        |> String.trim()
+        |> parse_categorical_feature_indexes()
+
+      _line ->
+        false
+    end)
+  end
+
+  defp parse_categorical_feature_indexes(""), do: []
+
+  defp parse_categorical_feature_indexes(value) do
+    value
+    |> String.split(",", trim: true)
+    |> Enum.map(fn index ->
+      index
+      |> String.trim()
+      |> String.to_integer()
+    end)
+  end
 
   defp validate_early_stopping_rounds!(rounds) when is_integer(rounds) and rounds > 0, do: rounds
 
