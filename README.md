@@ -79,6 +79,16 @@ Hinoki.CV.k_fold(df,
   num_iterations: 500,
   params: [objective: "regression", metric: "l2", num_threads: 1, seed: 42]
 )
+
+Hinoki.CV.grid_search(
+  {features, labels},
+  [learning_rate: [0.03, 0.1], num_leaves: [15, 31]],
+  k: 5,
+  max_concurrency: 5,
+  early_stopping_rounds: 10,
+  num_iterations: 500,
+  params: [objective: "regression", metric: "l2", num_threads: 1, seed: 42]
+)
 ```
 
 Saving to a directory writes a Hinoki bundle: `model.txt` stores the raw

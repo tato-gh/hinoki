@@ -3,6 +3,15 @@ defmodule Hinoki.CV do
   Cross-validation helpers for Hinoki models.
   """
 
+  @type cv_result :: %{
+          folds: [Hinoki.Booster.best()],
+          stats: %{
+            metric: binary(),
+            score: %{mean: float(), std: float()},
+            iteration: %{mean: float(), std: float()}
+          }
+        }
+
   @doc """
   Run k-fold cross-validation for tensor or DataFrame training data.
 
@@ -18,14 +27,7 @@ defmodule Hinoki.CV do
     * `:target` - required when input is an `Explorer.DataFrame`.
     * all other options are forwarded to `Hinoki.train/2`.
   """
-  @spec k_fold({Nx.Tensor.t(), Nx.Tensor.t()} | Explorer.DataFrame.t(), keyword()) :: %{
-          folds: [Hinoki.Booster.best()],
-          stats: %{
-            metric: binary(),
-            score: %{mean: float(), std: float()},
-            iteration: %{mean: float(), std: float()}
-          }
-        }
+  @spec k_fold({Nx.Tensor.t(), Nx.Tensor.t()} | Explorer.DataFrame.t(), keyword()) :: cv_result()
   def k_fold(input, opts \\ [])
 
   def k_fold({%Nx.Tensor{} = features, %Nx.Tensor{} = labels}, opts) when is_list(opts) do
@@ -93,6 +95,42 @@ defmodule Hinoki.CV do
   def k_fold(other, _opts) do
     raise ArgumentError,
           "expected an Explorer.DataFrame or {features, labels} tensor tuple for k-fold cross-validation, got: #{inspect(other)}"
+  end
+
+  @doc """
+  Run k-fold cross-validation for every parameter combination in `grid`.
+
+  `grid` must be a keyword list or map whose values are non-empty lists. Fixed
+  parameters are read from `opts[:params]`; grid parameters override fixed
+  parameters with the same key.
+
+  This function returns all results and does not choose the best result.
+  """
+  @spec grid_search(
+          {Nx.Tensor.t(), Nx.Tensor.t()} | Explorer.DataFrame.t(),
+          keyword() | map(),
+          keyword()
+        ) :: %{
+          results: [%{params: keyword(), cv: cv_result()}]
+        }
+  def grid_search(input, grid, opts \\ []) when is_list(opts) do
+    base_params = Keyword.get(opts, :params, [])
+
+    unless is_list(base_params) do
+      raise ArgumentError, "expected :params to be a keyword list, got: #{inspect(base_params)}"
+    end
+
+    results =
+      grid
+      |> grid_combinations()
+      |> Enum.map(fn grid_params ->
+        params = Keyword.merge(base_params, grid_params)
+        cv = k_fold(input, Keyword.put(opts, :params, params))
+
+        %{params: params, cv: cv}
+      end)
+
+    %{results: results}
   end
 
   defp validate_tensor_input!(features, labels) do
@@ -177,6 +215,33 @@ defmodule Hinoki.CV do
 
   defp take_rows(tensor, indices) do
     Nx.take(tensor, Nx.tensor(indices, type: :s64), axis: 0)
+  end
+
+  defp grid_combinations(grid) when is_map(grid) do
+    grid
+    |> Map.to_list()
+    |> grid_combinations()
+  end
+
+  defp grid_combinations(grid) when is_list(grid) do
+    unless Keyword.keyword?(grid) do
+      raise ArgumentError, "expected grid to be a keyword list or map, got: #{inspect(grid)}"
+    end
+
+    Enum.reduce(grid, [[]], fn {key, values}, combinations ->
+      unless is_list(values) and values != [] do
+        raise ArgumentError,
+              "expected grid value for #{inspect(key)} to be a non-empty list, got: #{inspect(values)}"
+      end
+
+      for combination <- combinations, value <- values do
+        Keyword.put(combination, key, value)
+      end
+    end)
+  end
+
+  defp grid_combinations(grid) do
+    raise ArgumentError, "expected grid to be a keyword list or map, got: #{inspect(grid)}"
   end
 
   defp stats([%{metric: metric} | _] = folds) do

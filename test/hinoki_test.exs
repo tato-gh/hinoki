@@ -569,6 +569,108 @@ defmodule HinokiTest do
     end
   end
 
+  describe "Hinoki.CV.grid_search/3" do
+    test "runs tensor k-fold cross-validation for every parameter combination" do
+      features =
+        Nx.tensor(
+          for x <- 0..39 do
+            xf = x / 10.0
+            [xf, :math.sin(xf)]
+          end,
+          type: :f64
+        )
+
+      labels =
+        Nx.tensor(
+          for x <- 0..39 do
+            xf = x / 10.0
+            :math.sin(xf * 3.0)
+          end,
+          type: :f32
+        )
+
+      result =
+        Hinoki.CV.grid_search(
+          {features, labels},
+          [learning_rate: [0.2, 0.3], num_leaves: [8, 16]],
+          k: 2,
+          max_concurrency: 2,
+          early_stopping_rounds: 3,
+          num_iterations: 20,
+          params: [
+            objective: "regression",
+            metric: "l2",
+            learning_rate: 0.1,
+            min_data_in_leaf: 1,
+            num_leaves: 4,
+            num_threads: 1,
+            seed: 42,
+            verbose: -1
+          ]
+        )
+
+      assert %{results: results} = result
+      assert length(results) == 4
+
+      assert Enum.map(results, fn %{params: params} ->
+               {params[:learning_rate], params[:num_leaves]}
+             end) == [
+               {0.2, 8},
+               {0.2, 16},
+               {0.3, 8},
+               {0.3, 16}
+             ]
+
+      assert Enum.all?(results, &match?(%{cv: %{folds: [_, _], stats: %{metric: "l2"}}}, &1))
+    end
+
+    test "runs DataFrame grid search with target option" do
+      df =
+        Explorer.DataFrame.new(
+          x:
+            for x <- 0..39 do
+              x / 10.0
+            end,
+          y:
+            for x <- 0..39 do
+              :math.sin(x / 10.0)
+            end
+        )
+
+      result =
+        Hinoki.CV.grid_search(df, [learning_rate: [0.2, 0.3]],
+          target: :y,
+          k: 2,
+          early_stopping_rounds: 3,
+          num_iterations: 20,
+          params: [
+            objective: "regression",
+            metric: "l2",
+            min_data_in_leaf: 1,
+            num_leaves: 8,
+            num_threads: 1,
+            seed: 42,
+            verbose: -1
+          ]
+        )
+
+      assert %{results: [%{cv: %{stats: %{metric: "l2"}}}, %{cv: %{stats: %{metric: "l2"}}}]} =
+               result
+    end
+
+    test "requires non-empty grid value lists" do
+      {features, labels} = TestData.binary_xor_like(4)
+
+      assert_raise ArgumentError, ~r/non-empty list/, fn ->
+        Hinoki.CV.grid_search({features, labels}, [learning_rate: []],
+          k: 2,
+          early_stopping_rounds: 2,
+          params: TestData.deterministic_params()
+        )
+      end
+    end
+  end
+
   describe "input validation" do
     test "labels row count must match features" do
       features = Nx.iota({10, 3}, type: :f64)
