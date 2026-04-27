@@ -25,6 +25,18 @@ defmodule Hinoki.NIF do
   def booster_predict_for_mat(_booster_ref, _features_bin, _nrow, _ncol, _params_bin),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  def booster_get_num_feature(_booster_ref),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def booster_get_num_classes(_booster_ref),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def booster_get_current_iteration(_booster_ref),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def booster_feature_importance(_booster_ref, _iteration, _importance_type),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def booster_save_model_to_string(_booster_ref, _start_iter, _num_iter, _importance_type),
     do: :erlang.nif_error(:nif_not_loaded)
 

@@ -121,6 +121,72 @@ defmodule Hinoki do
   @spec version() :: binary()
   def version, do: NIF.lgbm_version()
 
+  @doc """
+  Return booster metadata or derived information.
+
+  Supported keys:
+
+    * `:num_features`
+    * `:num_classes`
+    * `:current_iteration`
+    * `:feature_importance` — equivalent to `{:feature_importance, :gain}`
+    * `{:feature_importance, :gain}`
+    * `{:feature_importance, :split}`
+  """
+  @spec info(Booster.t(), atom() | tuple()) :: integer() | Nx.Tensor.t()
+  def info(%Booster{ref: ref}, :num_features) do
+    unwrap!(NIF.booster_get_num_feature(ref))
+  end
+
+  def info(%Booster{ref: ref}, :num_classes) do
+    unwrap!(NIF.booster_get_num_classes(ref))
+  end
+
+  def info(%Booster{ref: ref}, :current_iteration) do
+    unwrap!(NIF.booster_get_current_iteration(ref))
+  end
+
+  def info(%Booster{} = booster, :feature_importance) do
+    feature_importance(booster)
+  end
+
+  def info(%Booster{} = booster, {:feature_importance, type}) do
+    feature_importance(booster, type)
+  end
+
+  def info(%Booster{}, key) do
+    raise ArgumentError, "unsupported booster info key: #{inspect(key)}"
+  end
+
+  @doc "Return the number of features the booster was trained with."
+  @spec num_features(Booster.t()) :: non_neg_integer()
+  def num_features(%Booster{} = booster), do: info(booster, :num_features)
+
+  @doc "Return the number of classes known to the booster."
+  @spec num_classes(Booster.t()) :: pos_integer()
+  def num_classes(%Booster{} = booster), do: info(booster, :num_classes)
+
+  @doc "Return the current boosting iteration."
+  @spec current_iteration(Booster.t()) :: non_neg_integer()
+  def current_iteration(%Booster{} = booster), do: info(booster, :current_iteration)
+
+  @doc """
+  Return feature importance as an `Nx.Tensor`.
+
+  `type` may be `:gain` or `:split`. Gain importance is returned as `f64`;
+  split importance is returned as `s64`.
+  """
+  @spec feature_importance(Booster.t(), :gain | :split) :: Nx.Tensor.t()
+  def feature_importance(%Booster{ref: ref}, type \\ :gain) do
+    {importance_type, nx_type} = importance_type!(type)
+
+    ref
+    |> NIF.booster_feature_importance(0, importance_type)
+    |> unwrap!()
+    |> Nx.from_binary(:f64)
+    |> maybe_cast_importance(nx_type)
+  end
+
   # ---------- input → binary ----------
 
   defp to_train_payload({%Nx.Tensor{} = features, %Nx.Tensor{} = labels}, _target) do
@@ -246,6 +312,17 @@ defmodule Hinoki do
   defp format_param_value(v) when is_atom(v), do: Atom.to_string(v)
   defp format_param_value(v) when is_list(v), do: Enum.map_join(v, ",", &format_param_value/1)
   defp format_param_value(v), do: to_string(v)
+
+  defp importance_type!(:split), do: {0, :s64}
+  defp importance_type!(:gain), do: {1, :f64}
+
+  defp importance_type!(other) do
+    raise ArgumentError,
+          "expected feature importance type to be :gain or :split, got: #{inspect(other)}"
+  end
+
+  defp maybe_cast_importance(tensor, :f64), do: tensor
+  defp maybe_cast_importance(tensor, :s64), do: Nx.as_type(tensor, :s64)
 
   # ---------- NIF result unwrap ----------
 

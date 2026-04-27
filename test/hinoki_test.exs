@@ -125,7 +125,8 @@ defmodule HinokiTest do
 
       original = Hinoki.predict(booster, features)
 
-      tmp = Path.join(System.tmp_dir!(), "hinoki_roundtrip_#{System.unique_integer([:positive])}.txt")
+      tmp =
+        Path.join(System.tmp_dir!(), "hinoki_roundtrip_#{System.unique_integer([:positive])}.txt")
 
       try do
         :ok = Hinoki.save(booster, tmp)
@@ -150,8 +151,67 @@ defmodule HinokiTest do
       assert is_binary(bin) and byte_size(bin) > 0
       loaded = Hinoki.load_string(bin)
       assert %Booster{} = loaded
+
       assert Nx.to_flat_list(Hinoki.predict(booster, features)) ==
                Nx.to_flat_list(Hinoki.predict(loaded, features))
+    end
+  end
+
+  describe "booster introspection" do
+    test "returns scalar metadata" do
+      {features, labels} = TestData.binary_xor_like()
+
+      booster =
+        Hinoki.train({features, labels},
+          num_iterations: 20,
+          params: TestData.deterministic_params()
+        )
+
+      assert Hinoki.info(booster, :num_features) == 2
+      assert Hinoki.num_features(booster) == 2
+      assert is_integer(Hinoki.num_classes(booster))
+      assert Hinoki.num_classes(booster) >= 1
+      assert Hinoki.current_iteration(booster) > 0
+    end
+
+    test "returns feature importance as tensors" do
+      {features, labels} = TestData.binary_xor_like()
+
+      booster =
+        Hinoki.train({features, labels},
+          num_iterations: 20,
+          params: TestData.deterministic_params()
+        )
+
+      gain = Hinoki.feature_importance(booster)
+      split = Hinoki.feature_importance(booster, :split)
+
+      assert %Nx.Tensor{} = gain
+      assert %Nx.Tensor{} = split
+      assert Nx.shape(gain) == {2}
+      assert Nx.shape(split) == {2}
+      assert Nx.type(gain) == {:f, 64}
+      assert Nx.type(split) == {:s, 64}
+      assert Hinoki.info(booster, :feature_importance) == gain
+      assert Hinoki.info(booster, {:feature_importance, :split}) == split
+    end
+
+    test "rejects unsupported info and importance types" do
+      {features, labels} = TestData.binary_xor_like(10)
+
+      booster =
+        Hinoki.train({features, labels},
+          num_iterations: 10,
+          params: TestData.deterministic_params()
+        )
+
+      assert_raise ArgumentError, ~r/unsupported booster info key/, fn ->
+        Hinoki.info(booster, :unknown)
+      end
+
+      assert_raise ArgumentError, ~r/expected feature importance type/, fn ->
+        Hinoki.feature_importance(booster, :weight)
+      end
     end
   end
 

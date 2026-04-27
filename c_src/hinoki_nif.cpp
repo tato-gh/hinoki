@@ -278,6 +278,75 @@ static ERL_NIF_TERM nif_booster_predict_for_mat(ErlNifEnv *env, int argc,
     return mk_ok(env, out_term);
 }
 
+// booster_get_num_feature(booster)
+static ERL_NIF_TERM nif_booster_get_num_feature(ErlNifEnv *env, int argc,
+                                                const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    HinokiBooster *b;
+    if (!enif_get_resource(env, argv[0], HINOKI_BOOSTER_RES, (void **)&b))
+        return enif_make_badarg(env);
+
+    int out = 0;
+    int rc = LGBM_BoosterGetNumFeature(b->handle, &out);
+    if (rc != 0) return mk_lgbm_error(env);
+    return mk_ok(env, enif_make_int(env, out));
+}
+
+// booster_get_num_classes(booster)
+static ERL_NIF_TERM nif_booster_get_num_classes(ErlNifEnv *env, int argc,
+                                                const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    HinokiBooster *b;
+    if (!enif_get_resource(env, argv[0], HINOKI_BOOSTER_RES, (void **)&b))
+        return enif_make_badarg(env);
+
+    int out = 0;
+    int rc = LGBM_BoosterGetNumClasses(b->handle, &out);
+    if (rc != 0) return mk_lgbm_error(env);
+    return mk_ok(env, enif_make_int(env, out));
+}
+
+// booster_get_current_iteration(booster)
+static ERL_NIF_TERM nif_booster_get_current_iteration(ErlNifEnv *env, int argc,
+                                                      const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    HinokiBooster *b;
+    if (!enif_get_resource(env, argv[0], HINOKI_BOOSTER_RES, (void **)&b))
+        return enif_make_badarg(env);
+
+    int out = 0;
+    int rc = LGBM_BoosterGetCurrentIteration(b->handle, &out);
+    if (rc != 0) return mk_lgbm_error(env);
+    return mk_ok(env, enif_make_int(env, out));
+}
+
+// booster_feature_importance(booster, iteration, importance_type)
+//   importance_type: C_API_FEATURE_IMPORTANCE_SPLIT or C_API_FEATURE_IMPORTANCE_GAIN
+//   Returns {:ok, output_binary} where output_binary holds Float64 doubles.
+static ERL_NIF_TERM nif_booster_feature_importance(ErlNifEnv *env, int argc,
+                                                   const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    HinokiBooster *b;
+    int iteration, importance_type;
+    if (!enif_get_resource(env, argv[0], HINOKI_BOOSTER_RES, (void **)&b))
+        return enif_make_badarg(env);
+    if (!enif_get_int(env, argv[1], &iteration)) return enif_make_badarg(env);
+    if (!enif_get_int(env, argv[2], &importance_type)) return enif_make_badarg(env);
+
+    int num_features = 0;
+    int rc = LGBM_BoosterGetNumFeature(b->handle, &num_features);
+    if (rc != 0) return mk_lgbm_error(env);
+
+    ERL_NIF_TERM out_term;
+    unsigned char *out_buf = enif_make_new_binary(
+        env, (size_t)num_features * sizeof(double), &out_term);
+
+    rc = LGBM_BoosterFeatureImportance(
+        b->handle, iteration, importance_type, (double *)out_buf);
+    if (rc != 0) return mk_lgbm_error(env);
+    return mk_ok(env, out_term);
+}
+
 // booster_save_model_to_string(booster, start_iter, num_iter, importance_type)
 static ERL_NIF_TERM nif_booster_save_model_to_string(
     ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
@@ -357,6 +426,11 @@ static ErlNifFunc nif_funcs[] = {
     {"booster_update_iters", 2, nif_booster_update_iters,
      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"booster_predict_for_mat", 5, nif_booster_predict_for_mat,
+     ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"booster_get_num_feature", 1, nif_booster_get_num_feature, 0},
+    {"booster_get_num_classes", 1, nif_booster_get_num_classes, 0},
+    {"booster_get_current_iteration", 1, nif_booster_get_current_iteration, 0},
+    {"booster_feature_importance", 3, nif_booster_feature_importance,
      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"booster_save_model_to_string", 4, nif_booster_save_model_to_string,
      ERL_NIF_DIRTY_JOB_IO_BOUND},

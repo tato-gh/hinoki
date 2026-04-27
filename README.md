@@ -1,8 +1,8 @@
 # Hinoki ~ LightGBM bindings for Elixir.
 
-Status: pre-alpha. v0.1 surface is intentionally tiny — `train`,
-`predict`, `save`/`load`, and `dump`/`load_string`. Introspection,
-cross-validation, and early stopping are deferred to v0.2.
+Status: pre-alpha. The current surface covers `train`, `predict`,
+`save`/`load`, `dump`/`load_string`, and basic booster introspection.
+Cross-validation and early stopping are deferred.
 
 ## Architecture
 
@@ -34,6 +34,11 @@ booster =
   )
 
 preds = Hinoki.predict(booster, features)
+gain = Hinoki.feature_importance(booster)
+split = Hinoki.feature_importance(booster, :split)
+
+Hinoki.num_features(booster)
+Hinoki.current_iteration(booster)
 Hinoki.save(booster, "model.txt")
 ```
 
