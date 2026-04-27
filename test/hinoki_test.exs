@@ -363,6 +363,91 @@ defmodule HinokiTest do
       assert is_integer(right_split)
     end
 
+    test "returns permutation importance score statistics for tensor features" do
+      features =
+        Nx.tensor(
+          for x <- 0..39 do
+            xf = x / 10.0
+            [xf, :math.sin(xf)]
+          end,
+          type: :f64
+        )
+
+      labels =
+        Nx.tensor(
+          for x <- 0..39 do
+            xf = x / 10.0
+            :math.sin(xf)
+          end,
+          type: :f32
+        )
+
+      booster =
+        Hinoki.train({features, labels},
+          num_iterations: 30,
+          params: [objective: "regression", metric: "l2", num_threads: 1, seed: 42, verbose: -1]
+        )
+
+      metric_fn = fn y_true, y_pred ->
+        y_true
+        |> Nx.subtract(y_pred)
+        |> Nx.pow(2)
+        |> Nx.mean()
+      end
+
+      result =
+        Hinoki.permutation_importance(booster, features, labels, metric_fn,
+          features: [1],
+          n_repeats: 3,
+          seed: 42
+        )
+
+      assert %{baseline_score: baseline, results: [{1, stats}]} = result
+      assert is_number(baseline)
+      assert %{delta: delta, mean: mean, std: std, scores: scores} = stats
+      assert is_number(delta)
+      assert is_number(mean)
+      assert is_number(std)
+      assert length(scores) == 3
+      assert Enum.all?(scores, &is_number/1)
+      assert_in_delta delta, mean - baseline, 1.0e-12
+    end
+
+    test "uses DataFrame column names for permutation importance" do
+      df =
+        Explorer.DataFrame.new(
+          x1: Enum.map(0..39, &(&1 / 10.0)),
+          x2: Enum.map(0..39, &:math.sin(&1 / 10.0)),
+          y: Enum.map(0..39, &:math.sin(&1 / 10.0))
+        )
+
+      booster =
+        Hinoki.train(df,
+          target: :y,
+          num_iterations: 30,
+          params: [objective: "regression", metric: "l2", num_threads: 1, seed: 42, verbose: -1]
+        )
+
+      x = Explorer.DataFrame.discard(df, ["y"])
+
+      y =
+        df
+        |> Explorer.DataFrame.pull("y")
+        |> Explorer.Series.to_tensor()
+
+      metric_fn = fn y_true, y_pred -> Nx.mean(Nx.pow(Nx.subtract(y_true, y_pred), 2)) end
+
+      result =
+        Hinoki.permutation_importance(booster, x, y, metric_fn,
+          features: [:x2],
+          n_repeats: 2,
+          seed: 42
+        )
+
+      assert %{results: [{"x2", %{scores: scores}}]} = result
+      assert length(scores) == 2
+    end
+
     test "rejects unsupported info and importance types" do
       {features, labels} = TestData.binary_xor_like(10)
 
@@ -382,6 +467,26 @@ defmodule HinokiTest do
 
       assert_raise ArgumentError, ~r/expected 2 feature names/, fn ->
         Hinoki.named_feature_importance(booster, [:only_one])
+      end
+    end
+
+    test "rejects invalid permutation importance options" do
+      {features, labels} = TestData.binary_xor_like(10)
+
+      booster =
+        Hinoki.train({features, labels},
+          num_iterations: 10,
+          params: TestData.deterministic_params()
+        )
+
+      metric_fn = fn _y_true, _y_pred -> 0.0 end
+
+      assert_raise ArgumentError, ~r/expected :n_repeats/, fn ->
+        Hinoki.permutation_importance(booster, features, labels, metric_fn, n_repeats: 0)
+      end
+
+      assert_raise ArgumentError, ~r/permutation feature 2 not found/, fn ->
+        Hinoki.permutation_importance(booster, features, labels, metric_fn, features: [2])
       end
     end
   end

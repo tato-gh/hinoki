@@ -290,6 +290,78 @@ defmodule Hinoki do
     |> then(&Enum.zip(feature_names, &1))
   end
 
+  @doc """
+  Measure validation score changes after shuffling feature columns.
+
+  `metric_fn` is called as `metric_fn.(y, predictions)`. It may return a number
+  or an `Nx` scalar. Scores are returned as-is; `delta` is `mean - baseline_score`,
+  so callers can interpret the direction according to their metric.
+
+  Options:
+
+    * `:features` — subset of features to permute. Use indexes for tensor input
+      and column names for DataFrame input.
+    * `:n_repeats` — number of shuffles per feature. Default `5`.
+    * `:seed` — integer seed for reproducible shuffles.
+  """
+  @spec permutation_importance(
+          Booster.t(),
+          Nx.Tensor.t() | Explorer.DataFrame.t(),
+          term(),
+          fun(),
+          keyword()
+        ) ::
+          %{
+            baseline_score: number(),
+            results: [
+              {term(), %{delta: number(), mean: number(), std: number(), scores: [number()]}}
+            ]
+          }
+  def permutation_importance(%Booster{} = booster, x, y, metric_fn, opts \\ [])
+      when is_function(metric_fn, 2) and is_list(opts) do
+    n_repeats = validate_n_repeats!(Keyword.get(opts, :n_repeats, 5))
+    {features, feature_names} = to_permutation_features(x)
+    validate_feature_count!(elem(Nx.shape(features), 1), num_features(booster), "permutation")
+
+    target_features =
+      opts
+      |> Keyword.get(:features, feature_names)
+      |> normalize_permutation_target_features!(feature_names)
+
+    baseline_score =
+      booster
+      |> predict(x)
+      |> then(&metric_fn.(y, &1))
+      |> metric_score_to_number!()
+
+    seed = Keyword.get(opts, :seed)
+
+    results =
+      Enum.map(target_features, fn {feature, col_idx} ->
+        scores =
+          for repeat <- 1..n_repeats do
+            shuffled_features = shuffle_tensor_column(features, col_idx, seed, repeat)
+
+            booster
+            |> predict(shuffled_features)
+            |> then(&metric_fn.(y, &1))
+            |> metric_score_to_number!()
+          end
+
+        mean = mean(scores)
+
+        {feature,
+         %{
+           delta: mean - baseline_score,
+           mean: mean,
+           std: std(scores, mean),
+           scores: scores
+         }}
+      end)
+
+    %{baseline_score: baseline_score, results: results}
+  end
+
   # ---------- input → binary ----------
 
   defp create_dataset!(features_bin, labels_bin, nrow, ncol, params_bin, reference_ref \\ nil) do
@@ -560,6 +632,121 @@ defmodule Hinoki do
   defp validate_feature_count!(ncol, expected_ncol, context) do
     raise ArgumentError,
           "#{context} feature count #{ncol} does not match training feature count #{expected_ncol}"
+  end
+
+  defp to_permutation_features(%Nx.Tensor{} = features) do
+    {_features_bin, _nrow, ncol} = tensor_to_features_bin(features)
+    {features, Enum.to_list(0..(ncol - 1))}
+  end
+
+  defp to_permutation_features(%Explorer.DataFrame{} = df) do
+    feature_names = Explorer.DataFrame.names(df)
+
+    if feature_names == [] do
+      raise ArgumentError, "DataFrame has no feature columns for permutation importance"
+    end
+
+    {df_columns_to_tensor(df, feature_names), feature_names}
+  end
+
+  defp to_permutation_features(other) do
+    raise ArgumentError,
+          "expected an Explorer.DataFrame or Nx.Tensor for permutation importance, got: #{inspect(other)}"
+  end
+
+  defp normalize_permutation_target_features!(features, feature_names) do
+    features
+    |> List.wrap()
+    |> Enum.map(fn feature ->
+      normalized_feature = normalize_permutation_feature(feature, feature_names)
+
+      case Enum.find_index(feature_names, &(&1 == normalized_feature)) do
+        nil ->
+          raise ArgumentError,
+                "permutation feature #{inspect(feature)} not found; available features: #{inspect(feature_names)}"
+
+        col_idx ->
+          {normalized_feature, col_idx}
+      end
+    end)
+  end
+
+  defp normalize_permutation_feature(feature, feature_names) do
+    cond do
+      feature in feature_names -> feature
+      is_atom(feature) and to_string(feature) in feature_names -> to_string(feature)
+      true -> feature
+    end
+  end
+
+  defp validate_n_repeats!(n_repeats) when is_integer(n_repeats) and n_repeats > 0,
+    do: n_repeats
+
+  defp validate_n_repeats!(n_repeats) do
+    raise ArgumentError,
+          "expected :n_repeats to be a positive integer, got: #{inspect(n_repeats)}"
+  end
+
+  defp shuffle_tensor_column(features, col_idx, seed, repeat) do
+    rows = Nx.to_list(features)
+
+    shuffled_column =
+      rows
+      |> Enum.map(&Enum.at(&1, col_idx))
+      |> shuffle_values(seed, col_idx, repeat)
+
+    rows
+    |> Enum.zip(shuffled_column)
+    |> Enum.map(fn {row, value} -> List.replace_at(row, col_idx, value) end)
+    |> Nx.tensor(type: Nx.type(features))
+  end
+
+  defp shuffle_values(values, nil, _col_idx, _repeat), do: Enum.shuffle(values)
+
+  defp shuffle_values(values, seed, col_idx, repeat) when is_integer(seed) do
+    rand_state = :rand.seed_s(:exsss, {seed, col_idx + 1, repeat})
+
+    values
+    |> Enum.map_reduce(rand_state, fn value, state ->
+      {random, state} = :rand.uniform_s(state)
+      {{random, value}, state}
+    end)
+    |> elem(0)
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.map(&elem(&1, 1))
+  end
+
+  defp shuffle_values(_values, seed, _col_idx, _repeat) do
+    raise ArgumentError, "expected :seed to be an integer, got: #{inspect(seed)}"
+  end
+
+  defp metric_score_to_number!(score) when is_number(score), do: score
+
+  defp metric_score_to_number!(%Nx.Tensor{} = score) do
+    case Nx.shape(score) do
+      {} ->
+        score |> Nx.to_number()
+
+      shape ->
+        raise ArgumentError,
+              "expected metric_fn to return a number or Nx scalar, got tensor shape #{inspect(shape)}"
+    end
+  end
+
+  defp metric_score_to_number!(score) do
+    raise ArgumentError,
+          "expected metric_fn to return a number or Nx scalar, got: #{inspect(score)}"
+  end
+
+  defp mean(values), do: Enum.sum(values) / length(values)
+
+  defp std(values, mean) do
+    variance =
+      values
+      |> Enum.map(fn value -> :math.pow(value - mean, 2) end)
+      |> mean()
+
+    :math.sqrt(variance)
   end
 
   defp decode_predictions(bin, nrow) do
