@@ -1,8 +1,8 @@
 # Hinoki ~ LightGBM bindings for Elixir.
 
 Status: pre-alpha. The current surface covers `train`, `predict`,
-`save`/`load`, `dump`/`load_string`, and basic booster introspection.
-Cross-validation and early stopping are deferred.
+`save`/`load`, `dump`/`load_string`, basic booster introspection, and
+early stopping. Cross-validation is deferred.
 
 ## Architecture
 
@@ -55,6 +55,7 @@ booster =
   )
 
 Hinoki.current_iteration(booster)
+Hinoki.best(booster)
 ```
 
 DataFrames work too:

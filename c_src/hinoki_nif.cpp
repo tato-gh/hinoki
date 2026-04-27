@@ -327,7 +327,8 @@ static ERL_NIF_TERM nif_booster_update_iters(ErlNifEnv *env, int argc,
 
 // booster_update_iters_early_stopping(booster, n, stopping_rounds)
 //   Monitors the first metric on the first validation dataset.
-//   Returns {:ok, best_iteration} after rolling back to the best iteration.
+//   Returns {:ok, {best_iteration, best_score, metric_name, scores}}
+//   after rolling back to the best iteration.
 static ERL_NIF_TERM nif_booster_update_iters_early_stopping(
     ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
@@ -351,6 +352,7 @@ static ERL_NIF_TERM nif_booster_update_iters_early_stopping(
     double best_score = maximize ? -std::numeric_limits<double>::infinity()
                                  : std::numeric_limits<double>::infinity();
     int rounds_since_improvement = 0;
+    std::vector<double> scores;
 
     for (int i = 0; i < n; i++) {
         int finished = 0;
@@ -366,6 +368,7 @@ static ERL_NIF_TERM nif_booster_update_iters_early_stopping(
             if (rc != -2) return mk_lgbm_error(env);
             return mk_error(env, "early stopping requires validation evaluation results");
         }
+        scores.push_back(score);
 
         bool improved = maximize ? score > best_score : score < best_score;
         if (improved) {
@@ -379,6 +382,8 @@ static ERL_NIF_TERM nif_booster_update_iters_early_stopping(
         if (finished || rounds_since_improvement >= stopping_rounds) break;
     }
 
+    double returned_best_score = best_iteration > 0 ? best_score : 0.0;
+
     if (best_iteration > 0) {
         int rollback_count = current_iteration - best_iteration;
         for (int i = 0; i < rollback_count; i++) {
@@ -387,7 +392,20 @@ static ERL_NIF_TERM nif_booster_update_iters_early_stopping(
         }
     }
 
-    return mk_ok(env, enif_make_int(env, best_iteration));
+    ERL_NIF_TERM scores_list = enif_make_list(env, 0);
+    for (std::vector<double>::reverse_iterator it = scores.rbegin();
+         it != scores.rend(); ++it) {
+        scores_list = enif_make_list_cell(env, enif_make_double(env, *it), scores_list);
+    }
+
+    ERL_NIF_TERM result = enif_make_tuple4(
+        env,
+        enif_make_int(env, best_iteration),
+        enif_make_double(env, returned_best_score),
+        mk_binary(env, eval_name.c_str(), eval_name.size()),
+        scores_list);
+
+    return mk_ok(env, result);
 }
 
 // booster_predict_for_mat(booster, features_bin, nrow, ncol, params_bin)

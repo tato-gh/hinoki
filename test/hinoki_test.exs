@@ -160,6 +160,34 @@ defmodule HinokiTest do
         )
 
       assert Hinoki.current_iteration(booster) < 80
+
+      assert %{
+               iteration: best_iteration,
+               score: best_score,
+               metric: "l2"
+             } = Hinoki.best(booster)
+
+      assert best_iteration == Hinoki.current_iteration(booster)
+      assert is_float(best_score)
+      assert Hinoki.info(booster, :best) == Hinoki.best(booster)
+
+      assert %{"valid_0" => %{"l2" => scores}} = Hinoki.info(booster, :evals_result)
+      assert scores != []
+      assert Enum.all?(scores, &is_float/1)
+      assert Enum.min(scores) == best_score
+    end
+
+    test "has no best metadata without early stopping" do
+      {features, labels} = TestData.binary_xor_like()
+
+      booster =
+        Hinoki.train({features, labels},
+          num_iterations: 10,
+          params: TestData.deterministic_params()
+        )
+
+      assert Hinoki.best(booster) == nil
+      assert Hinoki.info(booster, :evals_result) == %{}
     end
   end
 

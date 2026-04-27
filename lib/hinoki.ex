@@ -94,9 +94,10 @@ defmodule Hinoki do
         valid_ref
       end)
 
-    run_training!(booster_ref, num_iter, early_stopping_rounds, valid_payloads, valid_refs)
+    training_metadata =
+      run_training!(booster_ref, num_iter, early_stopping_rounds, valid_payloads, valid_refs)
 
-    %Booster{ref: booster_ref}
+    struct!(Booster, Keyword.put(training_metadata, :ref, booster_ref))
   end
 
   @doc """
@@ -154,12 +155,21 @@ defmodule Hinoki do
     * `:num_features`
     * `:num_classes`
     * `:current_iteration`
+    * `:best`
+    * `:evals_result`
     * `:categorical_features`
     * `:feature_importance` — equivalent to `{:feature_importance, :gain}`
     * `{:feature_importance, :gain}`
     * `{:feature_importance, :split}`
   """
-  @spec info(Booster.t(), atom() | tuple()) :: integer() | [non_neg_integer()] | Nx.Tensor.t()
+  @spec info(Booster.t(), atom() | tuple()) ::
+          integer()
+          | float()
+          | nil
+          | [non_neg_integer()]
+          | Booster.best()
+          | Booster.evals_result()
+          | Nx.Tensor.t()
   def info(%Booster{ref: ref}, :num_features) do
     unwrap!(NIF.booster_get_num_feature(ref))
   end
@@ -170,6 +180,14 @@ defmodule Hinoki do
 
   def info(%Booster{ref: ref}, :current_iteration) do
     unwrap!(NIF.booster_get_current_iteration(ref))
+  end
+
+  def info(%Booster{} = booster, :best) do
+    best(booster)
+  end
+
+  def info(%Booster{evals_result: evals_result}, :evals_result) do
+    evals_result
   end
 
   def info(%Booster{} = booster, :categorical_features) do
@@ -199,6 +217,10 @@ defmodule Hinoki do
   @doc "Return the current boosting iteration."
   @spec current_iteration(Booster.t()) :: non_neg_integer()
   def current_iteration(%Booster{} = booster), do: info(booster, :current_iteration)
+
+  @doc "Return the best validation result observed during early stopping, or nil."
+  @spec best(Booster.t()) :: Booster.best() | nil
+  def best(%Booster{best: best}), do: best
 
   @doc "Return 0-based feature indexes marked as categorical in the booster."
   @spec categorical_features(Booster.t()) :: [non_neg_integer()]
@@ -249,6 +271,7 @@ defmodule Hinoki do
 
   defp run_training!(booster_ref, num_iter, nil, _valid_payloads, _valid_refs) do
     unwrap!(NIF.booster_update_iters(booster_ref, num_iter))
+    [best: nil, evals_result: %{}]
   end
 
   defp run_training!(booster_ref, num_iter, early_stopping_rounds, valid_payloads, valid_refs) do
@@ -260,7 +283,22 @@ defmodule Hinoki do
     end
 
     _ = valid_refs
-    unwrap!(NIF.booster_update_iters_early_stopping(booster_ref, num_iter, early_stopping_rounds))
+
+    {best_iteration, best_score, metric_name, scores} =
+      unwrap!(
+        NIF.booster_update_iters_early_stopping(booster_ref, num_iter, early_stopping_rounds)
+      )
+
+    dataset_name = "valid_0"
+
+    [
+      best: %{
+        iteration: best_iteration,
+        score: best_score,
+        metric: metric_name
+      },
+      evals_result: %{dataset_name => %{metric_name => scores}}
+    ]
   end
 
   defp to_train_payload({%Nx.Tensor{} = features, %Nx.Tensor{} = labels}, _target) do
