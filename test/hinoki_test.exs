@@ -622,6 +622,76 @@ defmodule HinokiTest do
           params: TestData.deterministic_params()
         )
       end
+
+      assert_raise ArgumentError, ~r/expected :folding_rule/, fn ->
+        Hinoki.CV.k_fold({features, labels},
+          k: 2,
+          folding_rule: :unknown,
+          early_stopping_rounds: 2,
+          params: TestData.deterministic_params()
+        )
+      end
+
+      assert_raise ArgumentError, ~r/expected :seed/, fn ->
+        Hinoki.CV.k_fold({features, labels},
+          k: 2,
+          folding_rule: :shuffle,
+          seed: "42",
+          early_stopping_rounds: 2,
+          params: TestData.deterministic_params()
+        )
+      end
+    end
+
+    test "supports shuffled tensor k-fold cross-validation" do
+      {features, labels} = TestData.binary_xor_like(30)
+
+      result =
+        Hinoki.CV.k_fold({features, labels},
+          k: 3,
+          folding_rule: :shuffle,
+          seed: 42,
+          early_stopping_rounds: 3,
+          num_iterations: 10,
+          params: TestData.deterministic_params()
+        )
+
+      assert %{folds: folds, stats: %{metric: "binary_logloss"}} = result
+      assert length(folds) == 3
+    end
+
+    test "seeded shuffle does not overwrite caller random state" do
+      {features, labels} = TestData.binary_xor_like(30)
+
+      :rand.seed(:exsss, {1, 2, 3})
+      expected = :rand.uniform()
+
+      :rand.seed(:exsss, {1, 2, 3})
+
+      Hinoki.CV.k_fold({features, labels},
+        k: 3,
+        folding_rule: :shuffle,
+        seed: 42,
+        early_stopping_rounds: 3,
+        num_iterations: 10,
+        params: TestData.deterministic_params()
+      )
+
+      assert :rand.uniform() == expected
+    end
+
+    test "stratified k-fold requires enough rows per label group" do
+      features = Nx.tensor([[0.0], [1.0], [2.0], [3.0]], type: :f32)
+      labels = Nx.tensor([0.0, 1.0, 2.0, 3.0], type: :f32)
+
+      assert_raise ArgumentError, ~r/every label group to have at least k rows/, fn ->
+        Hinoki.CV.k_fold({features, labels},
+          k: 2,
+          folding_rule: :stratified,
+          early_stopping_rounds: 2,
+          params: TestData.deterministic_params()
+        )
+      end
     end
 
     test "runs DataFrame k-fold cross-validation with target option" do
@@ -662,6 +732,29 @@ defmodule HinokiTest do
       assert %{folds: folds, stats: %{metric: "l2"}} = result
       assert length(folds) == 3
       assert Enum.all?(folds, &match?(%{iteration: _, score: _, metric: "l2"}, &1))
+    end
+
+    test "supports stratified shuffled DataFrame k-fold cross-validation" do
+      df =
+        Explorer.DataFrame.new(
+          x1: Enum.map(0..59, &(&1 / 10.0)),
+          x2: Enum.map(0..59, &:math.sin(&1 / 10.0)),
+          y: Enum.map(0..59, &rem(&1, 2))
+        )
+
+      result =
+        Hinoki.CV.k_fold(df,
+          target: :y,
+          k: 3,
+          folding_rule: :stratified_shuffle,
+          seed: 42,
+          early_stopping_rounds: 3,
+          num_iterations: 10,
+          params: TestData.deterministic_params()
+        )
+
+      assert %{folds: folds, stats: %{metric: "binary_logloss"}} = result
+      assert length(folds) == 3
     end
 
     test "DataFrame k-fold requires target option" do

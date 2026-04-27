@@ -2,7 +2,7 @@
 
 Status: pre-alpha. The current surface covers `train`, `predict`,
 `save`/`load`, `dump`/`load_string`, basic booster introspection, and
-early stopping. Cross-validation is deferred.
+early stopping.
 
 ## Architecture
 
@@ -76,6 +76,8 @@ returns fold best results plus aggregate stats:
 ```elixir
 Hinoki.CV.k_fold({features, labels},
   k: 5,
+  folding_rule: :stratified_shuffle,
+  seed: 42,
   max_concurrency: 5,
   early_stopping_rounds: 10,
   num_iterations: 500,

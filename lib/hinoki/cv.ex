@@ -22,6 +22,9 @@ defmodule Hinoki.CV do
   ## Options
 
     * `:k` - number of folds. Defaults to `5`.
+    * `:folding_rule` - one of `:raw`, `:shuffle`, `:stratified`, or
+      `:stratified_shuffle`. Defaults to `:raw`.
+    * `:seed` - integer seed for reproducible shuffled folding rules.
     * `:max_concurrency` - max number of folds to run concurrently. Defaults to `1`.
     * `:early_stopping_rounds` - required.
     * `:target` - required when input is an `Explorer.DataFrame`.
@@ -41,12 +44,13 @@ defmodule Hinoki.CV do
 
     nrow = validate_tensor_input!(features, labels)
     k = validate_k!(Keyword.get(opts, :k, 5), nrow)
+    folding_rule = validate_folding_rule!(Keyword.get(opts, :folding_rule, :raw))
+    seed = validate_seed!(Keyword.get(opts, :seed))
     max_concurrency = validate_max_concurrency!(Keyword.get(opts, :max_concurrency, 1), k)
-    train_opts = opts |> Keyword.delete(:k) |> Keyword.delete(:max_concurrency)
+    train_opts = train_opts(opts)
 
     folds =
-      nrow
-      |> fold_indices(k)
+      fold_indices(nrow, k, fn -> tensor_to_list(labels) end, folding_rule, seed)
       |> run_folds(max_concurrency, fn {train_idx, valid_idx} ->
         train_input = {take_rows(features, train_idx), take_rows(labels, train_idx)}
         valid_input = {take_rows(features, valid_idx), take_rows(labels, valid_idx)}
@@ -74,15 +78,18 @@ defmodule Hinoki.CV do
 
     nrow = Explorer.DataFrame.n_rows(df)
     k = validate_k!(Keyword.get(opts, :k, 5), nrow)
+    folding_rule = validate_folding_rule!(Keyword.get(opts, :folding_rule, :raw))
+    seed = validate_seed!(Keyword.get(opts, :seed))
     max_concurrency = validate_max_concurrency!(Keyword.get(opts, :max_concurrency, 1), k)
-    train_opts = opts |> Keyword.delete(:k) |> Keyword.delete(:max_concurrency)
+    target = Keyword.fetch!(opts, :target)
+    labels_fun = fn -> df |> Explorer.DataFrame.pull(target) |> Explorer.Series.to_list() end
+    train_opts = train_opts(opts)
 
     folds =
-      nrow
-      |> fold_ranges(k)
-      |> run_folds(max_concurrency, fn {offset, size} ->
-        train_df = dataframe_except_slice(df, offset, size, nrow)
-        valid_df = Explorer.DataFrame.slice(df, offset, size)
+      fold_indices(nrow, k, labels_fun, folding_rule, seed)
+      |> run_folds(max_concurrency, fn {train_idx, valid_idx} ->
+        train_df = Explorer.DataFrame.slice(df, train_idx)
+        valid_df = Explorer.DataFrame.slice(df, valid_idx)
 
         train_df
         |> Hinoki.train(Keyword.put(train_opts, :valid, valid_df))
@@ -160,6 +167,30 @@ defmodule Hinoki.CV do
           "expected :max_concurrency to be a positive integer, got: #{inspect(max_concurrency)}"
   end
 
+  defp validate_folding_rule!(rule)
+       when rule in [:raw, :shuffle, :stratified, :stratified_shuffle],
+       do: rule
+
+  defp validate_folding_rule!(rule) do
+    raise ArgumentError,
+          "expected :folding_rule to be one of :raw, :shuffle, :stratified, or :stratified_shuffle, got: #{inspect(rule)}"
+  end
+
+  defp validate_seed!(nil), do: nil
+  defp validate_seed!(seed) when is_integer(seed), do: seed
+
+  defp validate_seed!(seed) do
+    raise ArgumentError, "expected :seed to be an integer, got: #{inspect(seed)}"
+  end
+
+  defp train_opts(opts) do
+    opts
+    |> Keyword.delete(:k)
+    |> Keyword.delete(:folding_rule)
+    |> Keyword.delete(:seed)
+    |> Keyword.delete(:max_concurrency)
+  end
+
   defp run_folds(folds, 1, fun), do: Enum.map(folds, fun)
 
   defp run_folds(folds, max_concurrency, fun) do
@@ -172,10 +203,31 @@ defmodule Hinoki.CV do
     |> Enum.map(fn {:ok, fold} -> fold end)
   end
 
-  defp fold_indices(nrow, k) do
+  defp fold_indices(nrow, k, _labels_fun, :raw, _seed) do
     indices = Enum.to_list(0..(nrow - 1))
+    split_indices(indices, k)
+  end
 
-    fold_ranges(nrow, k)
+  defp fold_indices(nrow, k, _labels_fun, :shuffle, seed) do
+    indices =
+      0..(nrow - 1)
+      |> Enum.to_list()
+      |> shuffle_list(seed)
+
+    split_indices(indices, k)
+  end
+
+  defp fold_indices(nrow, k, labels_fun, :stratified, _seed) do
+    stratified_indices(nrow, labels_fun.(), k, false, nil)
+  end
+
+  defp fold_indices(nrow, k, labels_fun, :stratified_shuffle, seed) do
+    stratified_indices(nrow, labels_fun.(), k, true, seed)
+  end
+
+  defp split_indices(indices, k) do
+    length(indices)
+    |> fold_ranges(k)
     |> Enum.map(fn {offset, size} ->
       valid_idx = Enum.slice(indices, offset, size)
       valid_set = MapSet.new(valid_idx)
@@ -183,6 +235,59 @@ defmodule Hinoki.CV do
 
       {train_idx, valid_idx}
     end)
+  end
+
+  defp stratified_indices(nrow, labels, k, shuffle?, seed) do
+    unless length(labels) == nrow do
+      raise ArgumentError,
+            "expected labels length to match row count, got #{length(labels)} labels for #{nrow} rows"
+    end
+
+    labels
+    |> Enum.with_index()
+    |> Enum.group_by(fn {label, _idx} -> label end, fn {_label, idx} -> idx end)
+    |> Enum.sort_by(fn {label, _indices} -> label end)
+    |> Enum.map(fn {_label, indices} -> indices end)
+    |> validate_stratified_groups!(k)
+    |> Enum.with_index()
+    |> Enum.map(fn indices ->
+      {indices, group_index} = indices
+      indices = if shuffle?, do: shuffle_list(indices, seed, group_index), else: indices
+      validation_parts(indices, k)
+    end)
+    |> Enum.reduce(List.duplicate([], k), fn parts, folds ->
+      Enum.zip_with(folds, parts, &(&1 ++ &2))
+    end)
+    |> Enum.map(fn valid_idx ->
+      valid_set = MapSet.new(valid_idx)
+
+      train_idx =
+        0..(nrow - 1)
+        |> Enum.reject(&MapSet.member?(valid_set, &1))
+
+      {train_idx, valid_idx}
+    end)
+  end
+
+  defp validate_stratified_groups!(groups, k) do
+    smallest_undersized_group_size =
+      groups
+      |> Enum.map(&length/1)
+      |> Enum.filter(&(&1 < k))
+      |> min_or_nil()
+
+    if smallest_undersized_group_size do
+      raise ArgumentError,
+            "stratified k-fold requires every label group to have at least k rows; smallest group has #{smallest_undersized_group_size} rows for k=#{k}"
+    end
+
+    groups
+  end
+
+  defp validation_parts(indices, k) do
+    indices
+    |> split_indices(k)
+    |> Enum.map(fn {_train_idx, valid_idx} -> valid_idx end)
   end
 
   defp fold_ranges(nrow, k) do
@@ -198,23 +303,40 @@ defmodule Hinoki.CV do
     folds
   end
 
-  defp dataframe_except_slice(df, 0, size, nrow) do
-    Explorer.DataFrame.slice(df, size, nrow - size)
-  end
-
-  defp dataframe_except_slice(df, offset, size, nrow) when offset + size == nrow do
-    Explorer.DataFrame.slice(df, 0, offset)
-  end
-
-  defp dataframe_except_slice(df, offset, size, nrow) do
-    before = Explorer.DataFrame.slice(df, 0, offset)
-    after_slice = Explorer.DataFrame.slice(df, offset + size, nrow - offset - size)
-
-    Explorer.DataFrame.concat_rows(before, after_slice)
-  end
-
   defp take_rows(tensor, indices) do
     Nx.take(tensor, Nx.tensor(indices, type: :s64), axis: 0)
+  end
+
+  defp tensor_to_list(tensor) do
+    tensor
+    |> Nx.to_flat_list()
+  end
+
+  defp min_or_nil([]), do: nil
+  defp min_or_nil(values), do: Enum.min(values)
+
+  defp shuffle_list(values, seed, salt \\ 0)
+
+  defp shuffle_list(values, nil, salt) do
+    seed =
+      :erlang.unique_integer([:positive])
+      |> Kernel.+(:erlang.phash2({self(), System.monotonic_time(), salt}))
+
+    shuffle_list(values, seed, salt)
+  end
+
+  defp shuffle_list(values, seed, salt) do
+    state = :rand.seed_s(:exsss, {seed, seed + salt + 1, seed + salt + 2})
+
+    {tagged, _state} =
+      Enum.map_reduce(values, state, fn value, state ->
+        {key, state} = :rand.uniform_s(state)
+        {{key, value}, state}
+      end)
+
+    tagged
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.map(&elem(&1, 1))
   end
 
   defp grid_combinations(grid) when is_map(grid) do
