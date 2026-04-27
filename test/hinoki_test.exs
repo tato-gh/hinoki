@@ -111,6 +111,56 @@ defmodule HinokiTest do
       preds = Hinoki.predict(booster, features)
       assert Nx.shape(preds) == {9, 3}
     end
+
+    test "stops early when validation stops improving" do
+      train_features =
+        Nx.tensor(
+          for x <- 0..29 do
+            xf = x / 10.0
+            [xf, :math.sin(xf)]
+          end,
+          type: :f64
+        )
+
+      train_labels =
+        Nx.tensor(
+          for x <- 0..29 do
+            xf = x / 10.0
+            :math.sin(xf * 3.0)
+          end,
+          type: :f32
+        )
+
+      valid_features =
+        Nx.tensor(
+          for x <- 30..59 do
+            xf = x / 10.0
+            [xf, :math.sin(xf)]
+          end,
+          type: :f64
+        )
+
+      valid_labels = Nx.broadcast(0.0, {30})
+
+      booster =
+        Hinoki.train({train_features, train_labels},
+          valid: {valid_features, valid_labels},
+          early_stopping_rounds: 5,
+          num_iterations: 80,
+          params: [
+            objective: "regression",
+            metric: "l2",
+            learning_rate: 0.4,
+            min_data_in_leaf: 1,
+            num_leaves: 16,
+            num_threads: 1,
+            seed: 42,
+            verbose: -1
+          ]
+        )
+
+      assert Hinoki.current_iteration(booster) < 80
+    end
   end
 
   describe "save / load round-trip" do
@@ -284,6 +334,42 @@ defmodule HinokiTest do
 
       assert_raise RuntimeError, ~r/^LightGBM:/, fn ->
         Hinoki.predict(booster, wrong_features)
+      end
+    end
+
+    test "early stopping requires validation data" do
+      {features, labels} = TestData.binary_xor_like(10)
+
+      assert_raise ArgumentError, ~r/:early_stopping_rounds requires/, fn ->
+        Hinoki.train({features, labels},
+          early_stopping_rounds: 5,
+          params: TestData.deterministic_params()
+        )
+      end
+    end
+
+    test "early stopping rounds must be positive" do
+      {features, labels} = TestData.binary_xor_like(10)
+
+      assert_raise ArgumentError, ~r/positive integer/, fn ->
+        Hinoki.train({features, labels},
+          valid: {features, labels},
+          early_stopping_rounds: 0,
+          params: TestData.deterministic_params()
+        )
+      end
+    end
+
+    test "validation feature count must match training features" do
+      {features, labels} = TestData.binary_xor_like(10)
+      valid_features = Nx.iota({20, 3}, type: :f64)
+
+      assert_raise ArgumentError, ~r/validation feature count 3/, fn ->
+        Hinoki.train({features, labels},
+          valid: {valid_features, labels},
+          early_stopping_rounds: 5,
+          params: TestData.deterministic_params()
+        )
       end
     end
   end

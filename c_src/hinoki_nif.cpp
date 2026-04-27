@@ -11,6 +11,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <string>
+#include <vector>
+#include <limits>
+
 static ErlNifResourceType *HINOKI_DATASET_RES;
 static ErlNifResourceType *HINOKI_BOOSTER_RES;
 
@@ -115,6 +119,60 @@ static char *binary_to_cstring(ErlNifEnv *env, ERL_NIF_TERM term) {
     return s;
 }
 
+static bool higher_is_better(const std::string &name) {
+    return name.rfind("auc", 0) == 0 ||
+           name.rfind("ndcg@", 0) == 0 ||
+           name.rfind("map@", 0) == 0 ||
+           name.rfind("average_precision", 0) == 0;
+}
+
+static int get_first_eval_name(BoosterHandle handle, std::string *out) {
+    int eval_count = 0;
+    int rc = LGBM_BoosterGetEvalCounts(handle, &eval_count);
+    if (rc != 0) return rc;
+    if (eval_count <= 0) return -2;
+
+    const size_t buffer_len = 256;
+    size_t out_buffer_len = 0;
+    int out_len = 0;
+    std::vector<std::vector<char> > buffers(eval_count, std::vector<char>(buffer_len, '\0'));
+    std::vector<char *> names(eval_count, NULL);
+    for (int i = 0; i < eval_count; i++) names[i] = buffers[i].data();
+
+    rc = LGBM_BoosterGetEvalNames(handle, eval_count, &out_len, buffer_len,
+                                  &out_buffer_len, names.data());
+    if (rc != 0) return rc;
+    if (out_buffer_len > buffer_len) {
+        for (int i = 0; i < eval_count; i++) {
+            buffers[i].assign(out_buffer_len, '\0');
+            names[i] = buffers[i].data();
+        }
+        rc = LGBM_BoosterGetEvalNames(handle, eval_count, &out_len,
+                                      out_buffer_len, &out_buffer_len,
+                                      names.data());
+        if (rc != 0) return rc;
+    }
+
+    *out = std::string(buffers[0].data());
+    return 0;
+}
+
+static int get_first_valid_eval(BoosterHandle handle, double *out) {
+    int eval_count = 0;
+    int rc = LGBM_BoosterGetEvalCounts(handle, &eval_count);
+    if (rc != 0) return rc;
+    if (eval_count <= 0) return -2;
+
+    std::vector<double> results(eval_count, 0.0);
+    int out_len = 0;
+    rc = LGBM_BoosterGetEval(handle, 1, &out_len, results.data());
+    if (rc != 0) return rc;
+    if (out_len <= 0) return -2;
+
+    *out = results[0];
+    return 0;
+}
+
 // ---------- NIFs ----------
 
 static ERL_NIF_TERM nif_lgbm_version(ErlNifEnv *env, int argc,
@@ -131,18 +189,18 @@ static ERL_NIF_TERM nif_lgbm_version(ErlNifEnv *env, int argc,
     return mk_binary(env, v, strlen(v));
 }
 
-// dataset_create_from_mat(features_bin, nrow, ncol, params_bin)
-//   features_bin: row-major Float64 doubles, length = nrow*ncol*8 bytes
-static ERL_NIF_TERM nif_dataset_create_from_mat(ErlNifEnv *env, int argc,
-                                                const ERL_NIF_TERM argv[]) {
-    (void)argc;
+static ERL_NIF_TERM create_dataset_from_mat(ErlNifEnv *env, ERL_NIF_TERM features_term,
+                                            ERL_NIF_TERM nrow_term,
+                                            ERL_NIF_TERM ncol_term,
+                                            ERL_NIF_TERM params_term,
+                                            DatasetHandle reference) {
     ErlNifBinary features;
     int nrow, ncol;
-    if (!enif_inspect_binary(env, argv[0], &features)) return enif_make_badarg(env);
-    if (!enif_get_int(env, argv[1], &nrow)) return enif_make_badarg(env);
-    if (!enif_get_int(env, argv[2], &ncol)) return enif_make_badarg(env);
+    if (!enif_inspect_binary(env, features_term, &features)) return enif_make_badarg(env);
+    if (!enif_get_int(env, nrow_term, &nrow)) return enif_make_badarg(env);
+    if (!enif_get_int(env, ncol_term, &ncol)) return enif_make_badarg(env);
 
-    char *params = binary_to_cstring(env, argv[3]);
+    char *params = binary_to_cstring(env, params_term);
     if (params == NULL) return enif_make_badarg(env);
 
     if ((size_t)nrow * (size_t)ncol * sizeof(double) != features.size) {
@@ -153,7 +211,7 @@ static ERL_NIF_TERM nif_dataset_create_from_mat(ErlNifEnv *env, int argc,
     DatasetHandle out = NULL;
     int rc = LGBM_DatasetCreateFromMat(features.data, C_API_DTYPE_FLOAT64,
                                        nrow, ncol, /*is_row_major=*/1,
-                                       params, /*reference=*/NULL, &out);
+                                       params, reference, &out);
     enif_free(params);
     if (rc != 0) return mk_lgbm_error(env);
 
@@ -163,6 +221,26 @@ static ERL_NIF_TERM nif_dataset_create_from_mat(ErlNifEnv *env, int argc,
     ERL_NIF_TERM term = enif_make_resource(env, res);
     enif_release_resource(res);
     return mk_ok(env, term);
+}
+
+// dataset_create_from_mat(features_bin, nrow, ncol, params_bin)
+//   features_bin: row-major Float64 doubles, length = nrow*ncol*8 bytes
+static ERL_NIF_TERM nif_dataset_create_from_mat(ErlNifEnv *env, int argc,
+                                                const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    return create_dataset_from_mat(env, argv[0], argv[1], argv[2], argv[3], NULL);
+}
+
+// dataset_create_from_mat_reference(features_bin, nrow, ncol, params_bin, reference)
+static ERL_NIF_TERM nif_dataset_create_from_mat_reference(
+    ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    HinokiDataset *reference;
+    if (!enif_get_resource(env, argv[4], HINOKI_DATASET_RES, (void **)&reference))
+        return enif_make_badarg(env);
+
+    return create_dataset_from_mat(env, argv[0], argv[1], argv[2], argv[3],
+                                   reference->handle);
 }
 
 // dataset_set_label(dataset, labels_bin)
@@ -208,6 +286,22 @@ static ERL_NIF_TERM nif_booster_create(ErlNifEnv *env, int argc,
     return mk_ok(env, term);
 }
 
+// booster_add_valid_data(booster, dataset)
+static ERL_NIF_TERM nif_booster_add_valid_data(ErlNifEnv *env, int argc,
+                                               const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    HinokiBooster *b;
+    HinokiDataset *d;
+    if (!enif_get_resource(env, argv[0], HINOKI_BOOSTER_RES, (void **)&b))
+        return enif_make_badarg(env);
+    if (!enif_get_resource(env, argv[1], HINOKI_DATASET_RES, (void **)&d))
+        return enif_make_badarg(env);
+
+    int rc = LGBM_BoosterAddValidData(b->handle, d->handle);
+    if (rc != 0) return mk_lgbm_error(env);
+    return mk_atom(env, "ok");
+}
+
 // booster_update_iters(booster, n)
 //   Runs up to n boosting iterations; stops early if LightGBM signals
 //   convergence. Returns {:ok, iterations_run}.
@@ -229,6 +323,71 @@ static ERL_NIF_TERM nif_booster_update_iters(ErlNifEnv *env, int argc,
         if (finished) break;
     }
     return mk_ok(env, enif_make_int(env, ran));
+}
+
+// booster_update_iters_early_stopping(booster, n, stopping_rounds)
+//   Monitors the first metric on the first validation dataset.
+//   Returns {:ok, best_iteration} after rolling back to the best iteration.
+static ERL_NIF_TERM nif_booster_update_iters_early_stopping(
+    ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    HinokiBooster *b;
+    int n, stopping_rounds;
+    if (!enif_get_resource(env, argv[0], HINOKI_BOOSTER_RES, (void **)&b))
+        return enif_make_badarg(env);
+    if (!enif_get_int(env, argv[1], &n)) return enif_make_badarg(env);
+    if (!enif_get_int(env, argv[2], &stopping_rounds)) return enif_make_badarg(env);
+
+    std::string eval_name;
+    int rc = get_first_eval_name(b->handle, &eval_name);
+    if (rc != 0) {
+        if (rc != -2) return mk_lgbm_error(env);
+        return mk_error(env, "early stopping requires at least one evaluation metric");
+    }
+    bool maximize = higher_is_better(eval_name);
+
+    int best_iteration = 0;
+    int current_iteration = 0;
+    double best_score = maximize ? -std::numeric_limits<double>::infinity()
+                                 : std::numeric_limits<double>::infinity();
+    int rounds_since_improvement = 0;
+
+    for (int i = 0; i < n; i++) {
+        int finished = 0;
+        rc = LGBM_BoosterUpdateOneIter(b->handle, &finished);
+        if (rc != 0) return mk_lgbm_error(env);
+
+        rc = LGBM_BoosterGetCurrentIteration(b->handle, &current_iteration);
+        if (rc != 0) return mk_lgbm_error(env);
+
+        double score = 0.0;
+        rc = get_first_valid_eval(b->handle, &score);
+        if (rc != 0) {
+            if (rc != -2) return mk_lgbm_error(env);
+            return mk_error(env, "early stopping requires validation evaluation results");
+        }
+
+        bool improved = maximize ? score > best_score : score < best_score;
+        if (improved) {
+            best_score = score;
+            best_iteration = current_iteration;
+            rounds_since_improvement = 0;
+        } else {
+            rounds_since_improvement++;
+        }
+
+        if (finished || rounds_since_improvement >= stopping_rounds) break;
+    }
+
+    if (best_iteration > 0) {
+        int rollback_count = current_iteration - best_iteration;
+        for (int i = 0; i < rollback_count; i++) {
+            rc = LGBM_BoosterRollbackOneIter(b->handle);
+            if (rc != 0) return mk_lgbm_error(env);
+        }
+    }
+
+    return mk_ok(env, enif_make_int(env, best_iteration));
 }
 
 // booster_predict_for_mat(booster, features_bin, nrow, ncol, params_bin)
@@ -420,11 +579,17 @@ static ErlNifFunc nif_funcs[] = {
     {"lgbm_version", 0, nif_lgbm_version, 0},
     {"dataset_create_from_mat", 4, nif_dataset_create_from_mat,
      ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"dataset_create_from_mat_reference", 5,
+     nif_dataset_create_from_mat_reference, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"dataset_set_label", 2, nif_dataset_set_label,
      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"booster_create", 2, nif_booster_create, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"booster_add_valid_data", 2, nif_booster_add_valid_data,
+     ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"booster_update_iters", 2, nif_booster_update_iters,
      ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"booster_update_iters_early_stopping", 3,
+     nif_booster_update_iters_early_stopping, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"booster_predict_for_mat", 5, nif_booster_predict_for_mat,
      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"booster_get_num_feature", 1, nif_booster_get_num_feature, 0},

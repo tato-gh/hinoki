@@ -13,13 +13,22 @@ defmodule Hinoki.NIF do
   def dataset_create_from_mat(_features_bin, _nrow, _ncol, _params_bin),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  def dataset_create_from_mat_reference(_features_bin, _nrow, _ncol, _params_bin, _reference_ref),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def dataset_set_label(_dataset_ref, _labels_bin),
     do: :erlang.nif_error(:nif_not_loaded)
 
   def booster_create(_dataset_ref, _params_bin),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  def booster_add_valid_data(_booster_ref, _dataset_ref),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def booster_update_iters(_booster_ref, _n),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def booster_update_iters_early_stopping(_booster_ref, _n, _stopping_rounds),
     do: :erlang.nif_error(:nif_not_loaded)
 
   def booster_predict_for_mat(_booster_ref, _features_bin, _nrow, _ncol, _params_bin),

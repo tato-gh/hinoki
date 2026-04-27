@@ -42,6 +42,20 @@ Hinoki.current_iteration(booster)
 Hinoki.save(booster, "model.txt")
 ```
 
+Early stopping uses validation data:
+
+```elixir
+booster =
+  Hinoki.train({train_features, train_labels},
+    valid: {valid_features, valid_labels},
+    early_stopping_rounds: 10,
+    num_iterations: 500,
+    params: [objective: "regression", metric: "l2", num_threads: 1, seed: 42]
+  )
+
+Hinoki.current_iteration(booster)
+```
+
 DataFrames work too:
 
 ```elixir
