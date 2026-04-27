@@ -173,6 +173,7 @@ defmodule Hinoki do
     * `:num_features`
     * `:num_classes`
     * `:current_iteration`
+    * `:params`
     * `:best`
     * `:evals_result`
     * `:categorical_features`
@@ -184,6 +185,7 @@ defmodule Hinoki do
           integer()
           | float()
           | nil
+          | map()
           | [non_neg_integer()]
           | Booster.best()
           | Booster.evals_result()
@@ -198,6 +200,12 @@ defmodule Hinoki do
 
   def info(%Booster{ref: ref}, :current_iteration) do
     unwrap!(NIF.booster_get_current_iteration(ref))
+  end
+
+  def info(%Booster{} = booster, :params) do
+    booster
+    |> dump()
+    |> parse_model_params()
   end
 
   def info(%Booster{} = booster, :best) do
@@ -836,6 +844,55 @@ defmodule Hinoki do
       |> String.trim()
       |> String.to_integer()
     end)
+  end
+
+  defp parse_model_params(model_text) do
+    model_text
+    |> String.split("\n")
+    |> Enum.drop_while(&(&1 != "parameters:"))
+    |> Enum.drop(1)
+    |> Enum.take_while(&(&1 != "end of parameters"))
+    |> Enum.reduce(%{}, fn line, acc ->
+      case parse_model_param_line(line) do
+        nil -> acc
+        {key, value} -> Map.put(acc, key, value)
+      end
+    end)
+  end
+
+  defp parse_model_param_line("[" <> rest) do
+    rest = String.trim_trailing(rest, "]")
+
+    case String.split(rest, ": ", parts: 2) do
+      [key, value] -> {key, parse_model_param_value(value)}
+      _other -> nil
+    end
+  end
+
+  defp parse_model_param_line(_line), do: nil
+
+  defp parse_model_param_value(value) do
+    cond do
+      String.contains?(value, ",") ->
+        value
+        |> String.split(",", trim: true)
+        |> Enum.map(&parse_model_param_value(String.trim(&1)))
+
+      value == "true" ->
+        true
+
+      value == "false" ->
+        false
+
+      Regex.match?(~r/^-?\d+$/, value) ->
+        String.to_integer(value)
+
+      Regex.match?(~r/^-?\d+\.\d+$/, value) ->
+        String.to_float(value)
+
+      true ->
+        value
+    end
   end
 
   defp validate_early_stopping_rounds!(rounds) when is_integer(rounds) and rounds > 0, do: rounds

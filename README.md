@@ -41,6 +41,7 @@ named_gain = Hinoki.named_feature_importance(booster, [:x1, :x2])
 Hinoki.num_features(booster)
 Hinoki.current_iteration(booster)
 Hinoki.categorical_features(booster)
+Hinoki.info(booster, :params)
 
 Hinoki.permutation_importance(booster, features, labels, fn y, pred ->
   Nx.mean(Nx.pow(Nx.subtract(y, pred), 2))

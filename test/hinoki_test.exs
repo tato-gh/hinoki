@@ -317,6 +317,9 @@ defmodule HinokiTest do
       assert is_integer(Hinoki.num_classes(booster))
       assert Hinoki.num_classes(booster) >= 1
       assert Hinoki.current_iteration(booster) > 0
+      assert %{} = params = Hinoki.info(booster, :params)
+      assert params["objective"] == "binary"
+      assert params["metric"] == "binary_logloss"
       assert Hinoki.categorical_features(booster) == []
       assert Hinoki.info(booster, :categorical_features) == []
     end
