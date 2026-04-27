@@ -164,17 +164,17 @@ defmodule HinokiTest do
       assert %{
                iteration: best_iteration,
                score: best_score,
-               metric: "l2"
+               metric: "l2",
+               history: history
              } = Hinoki.best(booster)
 
       assert best_iteration == Hinoki.current_iteration(booster)
       assert is_float(best_score)
       assert Hinoki.info(booster, :best) == Hinoki.best(booster)
 
-      assert %{"valid_0" => %{"l2" => scores}} = Hinoki.info(booster, :evals_result)
-      assert scores != []
-      assert Enum.all?(scores, &is_float/1)
-      assert Enum.min(scores) == best_score
+      assert history != []
+      assert Enum.all?(history, &is_float/1)
+      assert Enum.min(history) == best_score
     end
 
     test "has no best metadata without early stopping" do
@@ -187,7 +187,7 @@ defmodule HinokiTest do
         )
 
       assert Hinoki.best(booster) == nil
-      assert Hinoki.info(booster, :evals_result) == %{}
+      assert Hinoki.info(booster, :best) == nil
     end
   end
 
@@ -274,7 +274,6 @@ defmodule HinokiTest do
         loaded = Hinoki.load(dir)
 
         assert Hinoki.best(loaded) == Hinoki.best(booster)
-        assert Hinoki.info(loaded, :evals_result) == Hinoki.info(booster, :evals_result)
 
         assert Nx.to_flat_list(Hinoki.predict(loaded, train_features)) ==
                  Nx.to_flat_list(Hinoki.predict(booster, train_features))

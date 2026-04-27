@@ -60,9 +60,9 @@ defmodule Hinoki do
     * `:params` — keyword/map of LightGBM parameters (e.g. `objective`, `learning_rate`).
     * `:target` — required when input is a `DataFrame`.
     * `:valid` — validation data for early stopping. Pass a `{features, labels}`
-      tuple, a DataFrame, or a list of either. DataFrame validation uses the same
-      `:target` column as training.
-    * `:early_stopping_rounds` — stop training when the first metric on the first
+      tuple or a DataFrame. DataFrame validation uses the same `:target` column
+      as training.
+    * `:early_stopping_rounds` — stop training when the first metric on the
       validation dataset does not improve for this many rounds.
   """
   @spec train(term(), keyword()) :: Booster.t()
@@ -73,7 +73,7 @@ defmodule Hinoki do
     early_stopping_rounds = Keyword.get(opts, :early_stopping_rounds)
 
     {features_bin, labels_bin, nrow, ncol, categorical_indices} = to_train_payload(input, target)
-    valid_payloads = to_valid_payloads(Keyword.get(opts, :valid, []), input, target, ncol)
+    valid_payload = to_valid_payload(Keyword.get(opts, :valid), input, target, ncol)
     params = maybe_put_categorical_feature(params, categorical_indices)
     params_bin = encode_params(params)
 
@@ -81,26 +81,29 @@ defmodule Hinoki do
 
     booster_ref = unwrap!(NIF.booster_create(dataset_ref, params_bin))
 
-    valid_refs =
-      Enum.map(valid_payloads, fn {valid_features_bin, valid_labels_bin, valid_nrow, valid_ncol} ->
-        valid_ref =
-          create_dataset!(
-            valid_features_bin,
-            valid_labels_bin,
-            valid_nrow,
-            valid_ncol,
-            params_bin,
-            dataset_ref
-          )
+    valid_ref =
+      case valid_payload do
+        nil ->
+          nil
 
-        unwrap!(NIF.booster_add_valid_data(booster_ref, valid_ref))
-        valid_ref
-      end)
+        {valid_features_bin, valid_labels_bin, valid_nrow, valid_ncol} ->
+          ref =
+            create_dataset!(
+              valid_features_bin,
+              valid_labels_bin,
+              valid_nrow,
+              valid_ncol,
+              params_bin,
+              dataset_ref
+            )
 
-    training_metadata =
-      run_training!(booster_ref, num_iter, early_stopping_rounds, valid_payloads, valid_refs)
+          unwrap!(NIF.booster_add_valid_data(booster_ref, ref))
+          ref
+      end
 
-    struct!(Booster, Keyword.put(training_metadata, :ref, booster_ref))
+    best = run_training!(booster_ref, num_iter, early_stopping_rounds, valid_payload, valid_ref)
+
+    %Booster{ref: booster_ref, best: best}
   end
 
   @doc """
@@ -126,7 +129,7 @@ defmodule Hinoki do
 
   File paths are written in LightGBM's raw text model format. Directory paths
   are written as a Hinoki bundle with `model.txt` and `hinoki.json`, preserving
-  Hinoki metadata such as `best` and `evals_result`. When saving to a new path,
+  Hinoki metadata such as `best`. When saving to a new path,
   paths without an extension are treated as bundle directories.
   """
   @spec save(Booster.t(), Path.t()) :: :ok
@@ -175,7 +178,6 @@ defmodule Hinoki do
     * `:current_iteration`
     * `:params`
     * `:best`
-    * `:evals_result`
     * `:categorical_features`
     * `:feature_importance` — equivalent to `{:feature_importance, :gain}`
     * `{:feature_importance, :gain}`
@@ -188,7 +190,6 @@ defmodule Hinoki do
           | map()
           | [non_neg_integer()]
           | Booster.best()
-          | Booster.evals_result()
           | Nx.Tensor.t()
   def info(%Booster{ref: ref}, :num_features) do
     unwrap!(NIF.booster_get_num_feature(ref))
@@ -210,10 +211,6 @@ defmodule Hinoki do
 
   def info(%Booster{} = booster, :best) do
     best(booster)
-  end
-
-  def info(%Booster{evals_result: evals_result}, :evals_result) do
-    evals_result
   end
 
   def info(%Booster{} = booster, :categorical_features) do
@@ -392,36 +389,29 @@ defmodule Hinoki do
     dataset_ref
   end
 
-  defp run_training!(booster_ref, num_iter, nil, _valid_payloads, _valid_refs) do
+  defp run_training!(booster_ref, num_iter, nil, _valid_payload, _valid_ref) do
     unwrap!(NIF.booster_update_iters(booster_ref, num_iter))
-    [best: nil, evals_result: %{}]
+    nil
   end
 
-  defp run_training!(booster_ref, num_iter, early_stopping_rounds, valid_payloads, valid_refs) do
+  defp run_training!(booster_ref, num_iter, early_stopping_rounds, valid_payload, _valid_ref) do
     early_stopping_rounds = validate_early_stopping_rounds!(early_stopping_rounds)
 
-    if valid_payloads == [] do
-      raise ArgumentError,
-            ":early_stopping_rounds requires at least one validation dataset in :valid"
+    if is_nil(valid_payload) do
+      raise ArgumentError, ":early_stopping_rounds requires a validation dataset in :valid"
     end
 
-    _ = valid_refs
-
-    {best_iteration, best_score, metric_name, scores} =
+    {best_iteration, best_score, metric_name, history} =
       unwrap!(
         NIF.booster_update_iters_early_stopping(booster_ref, num_iter, early_stopping_rounds)
       )
 
-    dataset_name = "valid_0"
-
-    [
-      best: %{
-        iteration: best_iteration,
-        score: best_score,
-        metric: metric_name
-      },
-      evals_result: %{dataset_name => %{metric_name => scores}}
-    ]
+    %{
+      iteration: best_iteration,
+      score: best_score,
+      metric: metric_name,
+      history: history
+    }
   end
 
   defp bundle_path?(path) do
@@ -433,10 +423,7 @@ defmodule Hinoki do
     File.mkdir_p!(path)
     File.write!(Path.join(path, @bundle_model_filename), dump(booster))
 
-    metadata = %{
-      "best" => encode_best(booster.best),
-      "evals_result" => booster.evals_result
-    }
+    metadata = %{"best" => encode_best(booster.best)}
 
     File.write!(Path.join(path, @bundle_metadata_filename), :json.encode(metadata))
   end
@@ -450,30 +437,33 @@ defmodule Hinoki do
       |> File.read!()
       |> :json.decode()
 
-    %Booster{
-      booster
-      | best: decode_best(Map.get(metadata, "best")),
-        evals_result: Map.get(metadata, "evals_result", %{})
-    }
+    %Booster{booster | best: decode_best(Map.get(metadata, "best"))}
   end
 
   defp encode_best(nil), do: nil
 
-  defp encode_best(%{iteration: iteration, score: score, metric: metric}) do
+  defp encode_best(%{iteration: iteration, score: score, metric: metric, history: history}) do
     %{
       "iteration" => iteration,
       "score" => score,
-      "metric" => metric
+      "metric" => metric,
+      "history" => history
     }
   end
 
   defp decode_best(nil), do: nil
 
-  defp decode_best(%{"iteration" => iteration, "score" => score, "metric" => metric}) do
+  defp decode_best(%{
+         "iteration" => iteration,
+         "score" => score,
+         "metric" => metric,
+         "history" => history
+       }) do
     %{
       iteration: iteration,
       score: score,
-      metric: metric
+      metric: metric,
+      history: history
     }
   end
 
@@ -525,23 +515,7 @@ defmodule Hinoki do
           "expected an Explorer.DataFrame or {features, labels} tensor tuple, got: #{inspect(other)}"
   end
 
-  defp to_valid_payloads(nil, _train_input, _target, _expected_ncol), do: []
-  defp to_valid_payloads([], _train_input, _target, _expected_ncol), do: []
-
-  defp to_valid_payloads(valid, train_input, target, expected_ncol) do
-    valid
-    |> normalize_valid()
-    |> Enum.map(&to_valid_payload(&1, train_input, target, expected_ncol))
-  end
-
-  defp normalize_valid({%Nx.Tensor{}, %Nx.Tensor{}} = valid), do: [valid]
-  defp normalize_valid(%Explorer.DataFrame{} = valid), do: [valid]
-  defp normalize_valid(valid) when is_list(valid), do: valid
-
-  defp normalize_valid(other) do
-    raise ArgumentError,
-          "expected :valid to be a validation dataset or a list of validation datasets, got: #{inspect(other)}"
-  end
+  defp to_valid_payload(nil, _train_input, _target, _expected_ncol), do: nil
 
   defp to_valid_payload(
          {%Nx.Tensor{} = features, %Nx.Tensor{} = labels},
@@ -568,7 +542,7 @@ defmodule Hinoki do
 
   defp to_valid_payload(other, _train_input, _target, _expected_ncol) do
     raise ArgumentError,
-          "expected each validation dataset to be an Explorer.DataFrame or {features, labels} tensor tuple, got: #{inspect(other)}"
+          "expected :valid to be an Explorer.DataFrame or {features, labels} tensor tuple, got: #{inspect(other)}"
   end
 
   defp to_predict_payload(%Nx.Tensor{} = features) do
