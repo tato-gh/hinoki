@@ -1,28 +1,15 @@
-# Hinoki ~ LightGBM bindings for Elixir.
+# Hinoki
 
-Status: pre-alpha. The current surface covers `train`, `predict`,
-`save`/`load`, `dump`/`load_string`, basic booster introspection, and
-early stopping.
+LightGBM bindings for Elixir.
 
-## Architecture
-
-- A single NIF talks to LightGBM's C-API. No CLI.
-- All heavy operations are scheduled as dirty NIFs (`ERL_NIF_DIRTY_JOB_CPU_BOUND`
-  for compute, `ERL_NIF_DIRTY_JOB_IO_BOUND` for serialization).
-- Boosters and datasets are held as Erlang resource objects. The
-  destructor calls `LGBM_BoosterFree` / `LGBM_DatasetFree`, so process
-  death cleans up automatically — no manual `free`.
-- The native build pulls a pinned LightGBM commit, builds it via CMake,
-  and stages `lib_lightgbm.so` next to the NIF using `rpath=$ORIGIN/lib`.
-
-## Threading
-
-LightGBM uses OpenMP internally and runs *outside* the BEAM scheduler
-on the dirty thread pool. By default it tries to use every CPU on the
-machine, which can starve the BEAM. **Always set `num_threads`
-explicitly** to a value compatible with your scheduler topology.
+Hinoki provides training and prediction for `Nx.Tensor` and
+`Explorer.DataFrame` inputs, model save/load helpers, early stopping,
+feature importance, permutation importance, k-fold cross-validation, and
+grid search.
 
 ## Usage
+
+Tensor input:
 
 ```elixir
 {features, labels} = some_data()
@@ -34,14 +21,42 @@ booster =
   )
 
 preds = Hinoki.predict(booster, features)
+```
+
+DataFrame input:
+
+```elixir
+booster =
+  Hinoki.train(df,
+    target: :label,
+    params: [objective: "regression", num_threads: 1, seed: 42]
+  )
+
+preds = Hinoki.predict(booster, Explorer.DataFrame.discard(df, ["label"]))
+```
+
+Parameters are forwarded to LightGBM. Set `num_threads` explicitly,
+because LightGBM uses OpenMP internally and can otherwise consume every
+CPU on the machine.
+
+DataFrame columns with Explorer's `:category` dtype are passed to
+LightGBM as categorical features automatically. Tensor input has no
+column dtype metadata, so pass `categorical_feature` in `:params` when
+using `Nx.Tensor` features.
+
+## Introspection and Importance
+
+```elixir
 gain = Hinoki.feature_importance(booster)
 split = Hinoki.feature_importance(booster, :split)
 named_gain = Hinoki.named_feature_importance(booster, [:x1, :x2])
 
 Hinoki.num_features(booster)
+Hinoki.num_classes(booster)
 Hinoki.current_iteration(booster)
 Hinoki.categorical_features(booster)
 Hinoki.info(booster, :params)
+Hinoki.version()
 
 Hinoki.permutation_importance(booster, features, labels, fn y, pred ->
   Nx.mean(Nx.pow(Nx.subtract(y, pred), 2))
@@ -50,12 +65,12 @@ end,
   n_repeats: 5,
   seed: 42
 )
-
-Hinoki.save(booster, "path/to/model.txt")
-Hinoki.save(booster, "path/to/model_dir")
 ```
 
-Early stopping uses validation data:
+## Early Stopping
+
+Early stopping uses validation data and records the best validation
+result in the returned booster.
 
 ```elixir
 booster =
@@ -70,8 +85,10 @@ Hinoki.current_iteration(booster)
 Hinoki.best(booster)
 ```
 
-Cross-validation uses each fold's validation data for early stopping and
-returns fold best results plus aggregate stats:
+## Cross-Validation
+
+Cross-validation uses each fold's validation data for early stopping.
+`Hinoki.CV.k_fold/2` returns fold best results plus aggregate stats.
 
 ```elixir
 Hinoki.CV.k_fold({features, labels},
@@ -103,29 +120,32 @@ Hinoki.CV.grid_search(
 )
 ```
 
-Saving to a directory writes a Hinoki bundle: `model.txt` stores the raw
-LightGBM model and `hinoki.json` stores Hinoki metadata such as early stopping
-results. Loading the directory restores both:
+## Persistence
+
+Saving to a path with an extension writes a raw LightGBM text model.
+Saving to a directory, or to a new path without an extension, writes a
+Hinoki bundle: `model.txt` stores the raw LightGBM model and
+`hinoki.json` stores Hinoki metadata such as early stopping results.
+Loading the directory restores both:
 
 ```elixir
+Hinoki.save(booster, "path/to/model.txt")
+
 Hinoki.save(booster, "path/to/model_dir")
 loaded = Hinoki.load("path/to/model_dir")
 Hinoki.best(loaded)
 ```
 
-DataFrames work too:
+## Notes
 
-```elixir
-Hinoki.train(df, target: :label, params: [objective: "regression", num_threads: 1, seed: 42])
-```
+- `Hinoki.CV.k_fold/2` requires `:early_stopping_rounds` and builds each
+  fold's validation data internally.
 
-DataFrame columns with Explorer's `:category` dtype are passed to
-LightGBM as categorical features automatically. Tensor input has no
-column dtype metadata, so pass `categorical_feature` in `:params` when
-using `Nx.Tensor` features. `Hinoki.categorical_features/1` returns
-the 0-based feature indexes marked as categorical in the trained model.
+## Implementation
 
-## Reproducibility
+Hinoki links against LightGBM 4.3.0 and calls its C API through a NIF.
+Model resources are managed automatically.
 
-Floating-point training results are only bit-identical with
-`num_threads: 1` plus a fixed `seed`. Tests rely on this.
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
