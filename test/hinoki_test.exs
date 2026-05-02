@@ -716,6 +716,177 @@ defmodule HinokiTest do
       end
     end
 
+    test "runs tensor grouped ranking k-fold cross-validation" do
+      features =
+        Nx.tensor(
+          [
+            [0.9, 0.1],
+            [0.4, 0.5],
+            [0.1, 0.9],
+            [0.8, 0.2],
+            [0.3, 0.6],
+            [0.2, 0.8],
+            [0.95, 0.0],
+            [0.5, 0.4],
+            [0.05, 1.0],
+            [0.85, 0.15],
+            [0.45, 0.45],
+            [0.15, 0.85]
+          ],
+          type: :f64
+        )
+
+      labels = Nx.tensor([2, 1, 0, 2, 1, 0, 2, 1, 0, 2, 1, 0], type: :f32)
+
+      result =
+        Hinoki.CV.k_fold({features, labels},
+          group: [3, 3, 3, 3],
+          k: 2,
+          folding_rule: :shuffle,
+          seed: 42,
+          early_stopping_rounds: 2,
+          num_iterations: 8,
+          params: [
+            objective: "lambdarank",
+            metric: "ndcg",
+            learning_rate: 0.2,
+            min_data_in_leaf: 1,
+            num_leaves: 4,
+            num_threads: 1,
+            seed: 42,
+            verbose: -1
+          ]
+        )
+
+      assert %{folds: folds, stats: %{metric: metric}} = result
+      assert length(folds) == 2
+      assert String.starts_with?(metric, "ndcg")
+      assert Enum.all?(folds, &String.starts_with?(&1.metric, "ndcg"))
+    end
+
+    test "runs tensor grouped ranking k-fold with uneven group sizes" do
+      group = [2, 5, 3, 4]
+
+      features =
+        group
+        |> Enum.with_index()
+        |> Enum.flat_map(fn {size, group_idx} ->
+          for row_idx <- 0..(size - 1) do
+            rank_signal = (size - row_idx) / size
+            [rank_signal, group_idx / 10.0]
+          end
+        end)
+        |> Nx.tensor(type: :f64)
+
+      labels =
+        group
+        |> Enum.flat_map(fn size -> Enum.reverse(0..(size - 1)) end)
+        |> Nx.tensor(type: :f32)
+
+      result =
+        Hinoki.CV.k_fold({features, labels},
+          group: group,
+          k: 2,
+          folding_rule: :raw,
+          early_stopping_rounds: 2,
+          num_iterations: 8,
+          params: [
+            objective: "lambdarank",
+            metric: "ndcg",
+            learning_rate: 0.2,
+            min_data_in_leaf: 1,
+            num_leaves: 4,
+            num_threads: 1,
+            seed: 42,
+            verbose: -1
+          ]
+        )
+
+      assert %{folds: folds, stats: %{metric: metric}} = result
+      assert length(folds) == 2
+      assert String.starts_with?(metric, "ndcg")
+      assert Enum.all?(folds, &String.starts_with?(&1.metric, "ndcg"))
+    end
+
+    test "runs DataFrame grouped ranking k-fold cross-validation" do
+      df =
+        Explorer.DataFrame.new(
+          group_label: ["a", "a", "a", "b", "b", "b", "c", "c", "c", "d", "d", "d"],
+          score: [0.9, 0.4, 0.1, 0.8, 0.3, 0.2, 0.95, 0.5, 0.05, 0.85, 0.45, 0.15],
+          noise: [0.1, 0.5, 0.9, 0.2, 0.6, 0.8, 0.0, 0.4, 1.0, 0.15, 0.45, 0.85],
+          label: [2, 1, 0, 2, 1, 0, 2, 1, 0, 2, 1, 0]
+        )
+
+      result =
+        Hinoki.CV.k_fold(df,
+          target: :label,
+          group: :group_label,
+          k: 2,
+          folding_rule: :shuffle,
+          seed: 42,
+          early_stopping_rounds: 2,
+          num_iterations: 8,
+          params: [
+            objective: "lambdarank",
+            metric: "ndcg",
+            learning_rate: 0.2,
+            min_data_in_leaf: 1,
+            num_leaves: 4,
+            num_threads: 1,
+            seed: 42,
+            verbose: -1
+          ]
+        )
+
+      assert %{folds: folds, stats: %{metric: metric}} = result
+      assert length(folds) == 2
+      assert String.starts_with?(metric, "ndcg")
+      assert Enum.all?(folds, &String.starts_with?(&1.metric, "ndcg"))
+    end
+
+    test "DataFrame grouped k-fold requires contiguous group column" do
+      df =
+        Explorer.DataFrame.new(
+          group_label: ["a", "a", "b", "b", "a", "c"],
+          score: [0.9, 0.4, 0.8, 0.3, 0.1, 0.2],
+          label: [2, 1, 2, 1, 0, 0]
+        )
+
+      assert_raise ArgumentError, ~r/must be ordered by contiguous groups/, fn ->
+        Hinoki.CV.k_fold(df,
+          target: :label,
+          group: :group_label,
+          k: 2,
+          early_stopping_rounds: 2,
+          params: [objective: "lambdarank", metric: "ndcg", num_threads: 1, verbose: -1]
+        )
+      end
+    end
+
+    test "rejects unsupported grouped k-fold options" do
+      {features, labels} = TestData.binary_xor_like(3)
+
+      assert_raise ArgumentError, ~r/do not pass :valid_group/, fn ->
+        Hinoki.CV.k_fold({features, labels},
+          group: [3, 3],
+          valid_group: [3, 3],
+          k: 2,
+          early_stopping_rounds: 2,
+          params: [objective: "lambdarank", metric: "ndcg", num_threads: 1, verbose: -1]
+        )
+      end
+
+      assert_raise ArgumentError, ~r/supports :raw and :shuffle/, fn ->
+        Hinoki.CV.k_fold({features, labels},
+          group: [3, 3],
+          k: 2,
+          folding_rule: :stratified,
+          early_stopping_rounds: 2,
+          params: [objective: "lambdarank", metric: "ndcg", num_threads: 1, verbose: -1]
+        )
+      end
+    end
+
     test "supports shuffled tensor k-fold cross-validation" do
       {features, labels} = TestData.binary_xor_like(30)
 

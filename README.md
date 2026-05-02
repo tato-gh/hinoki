@@ -144,6 +144,16 @@ Hinoki.CV.k_fold(df,
   params: [objective: "regression", metric: "l2", num_threads: 1, seed: 42]
 )
 
+Hinoki.CV.k_fold(df,
+  target: :label,
+  group: :group_label,
+  k: 5,
+  folding_rule: :shuffle,
+  early_stopping_rounds: 10,
+  num_iterations: 500,
+  params: [objective: "lambdarank", metric: "ndcg", num_threads: 1, seed: 42]
+)
+
 Hinoki.CV.grid_search(
   {features, labels},
   [learning_rate: [0.03, 0.1], num_leaves: [15, 31]],
@@ -174,7 +184,10 @@ Hinoki.best(loaded)
 ## Notes
 
 - `Hinoki.CV.k_fold/2` requires `:early_stopping_rounds` and builds each
-  fold's validation data internally.
+  fold's validation data internally. Do not pass `:valid` or `:valid_group`.
+- Grouped `Hinoki.CV.k_fold/2` supports `:raw` and `:shuffle` folding rules.
+  Stratified folding is row-label based and is not supported for ranking
+  groups.
 
 ## Implementation
 

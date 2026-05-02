@@ -28,73 +28,47 @@ defmodule Hinoki.CV do
     * `:max_concurrency` - max number of folds to run concurrently. Defaults to `1`.
     * `:early_stopping_rounds` - required.
     * `:target` - required when input is an `Explorer.DataFrame`.
+    * `:group` - ranking group sizes for tensor input, or a group column name
+      for DataFrame input. Grouped cross-validation splits by group.
+    * `:valid` and `:valid_group` are built internally and must not be passed.
     * all other options are forwarded to `Hinoki.train/2`.
   """
   @spec k_fold({Nx.Tensor.t(), Nx.Tensor.t()} | Explorer.DataFrame.t(), keyword()) :: cv_result()
   def k_fold(input, opts \\ [])
 
   def k_fold({%Nx.Tensor{} = features, %Nx.Tensor{} = labels}, opts) when is_list(opts) do
-    if Keyword.has_key?(opts, :valid) do
-      raise ArgumentError, "Hinoki.CV.k_fold/2 builds validation folds; do not pass :valid"
-    end
-
-    unless Keyword.has_key?(opts, :early_stopping_rounds) do
-      raise ArgumentError, "Hinoki.CV.k_fold/2 requires :early_stopping_rounds"
-    end
-
+    cv_opts = validate_common_k_fold_opts!(opts)
     nrow = validate_tensor_input!(features, labels)
-    k = validate_k!(Keyword.get(opts, :k, 5), nrow)
-    folding_rule = validate_folding_rule!(Keyword.get(opts, :folding_rule, :raw))
-    seed = validate_seed!(Keyword.get(opts, :seed))
-    max_concurrency = validate_max_concurrency!(Keyword.get(opts, :max_concurrency, 1), k)
-    train_opts = train_opts(opts)
 
     folds =
-      fold_indices(nrow, k, fn -> tensor_to_list(labels) end, folding_rule, seed)
-      |> run_folds(max_concurrency, fn {train_idx, valid_idx} ->
-        train_input = {take_rows(features, train_idx), take_rows(labels, train_idx)}
-        valid_input = {take_rows(features, valid_idx), take_rows(labels, valid_idx)}
+      case Keyword.get(opts, :group) do
+        nil ->
+          run_tensor_row_folds(features, labels, nrow, opts, cv_opts)
 
-        train_input
-        |> Hinoki.train(Keyword.put(train_opts, :valid, valid_input))
-        |> Hinoki.best()
-      end)
+        group ->
+          run_tensor_group_folds(features, labels, group, nrow, opts, cv_opts)
+      end
 
     %{folds: folds, stats: stats(folds)}
   end
 
   def k_fold(%Explorer.DataFrame{} = df, opts) when is_list(opts) do
-    if Keyword.has_key?(opts, :valid) do
-      raise ArgumentError, "Hinoki.CV.k_fold/2 builds validation folds; do not pass :valid"
-    end
-
-    unless Keyword.has_key?(opts, :early_stopping_rounds) do
-      raise ArgumentError, "Hinoki.CV.k_fold/2 requires :early_stopping_rounds"
-    end
+    cv_opts = validate_common_k_fold_opts!(opts)
 
     unless Keyword.has_key?(opts, :target) do
       raise ArgumentError, "DataFrame k-fold cross-validation requires the :target option"
     end
 
     nrow = Explorer.DataFrame.n_rows(df)
-    k = validate_k!(Keyword.get(opts, :k, 5), nrow)
-    folding_rule = validate_folding_rule!(Keyword.get(opts, :folding_rule, :raw))
-    seed = validate_seed!(Keyword.get(opts, :seed))
-    max_concurrency = validate_max_concurrency!(Keyword.get(opts, :max_concurrency, 1), k)
-    target = Keyword.fetch!(opts, :target)
-    labels_fun = fn -> df |> Explorer.DataFrame.pull(target) |> Explorer.Series.to_list() end
-    train_opts = train_opts(opts)
 
     folds =
-      fold_indices(nrow, k, labels_fun, folding_rule, seed)
-      |> run_folds(max_concurrency, fn {train_idx, valid_idx} ->
-        train_df = Explorer.DataFrame.slice(df, train_idx)
-        valid_df = Explorer.DataFrame.slice(df, valid_idx)
+      case Keyword.get(opts, :group) do
+        nil ->
+          run_dataframe_row_folds(df, nrow, opts, cv_opts)
 
-        train_df
-        |> Hinoki.train(Keyword.put(train_opts, :valid, valid_df))
-        |> Hinoki.best()
-      end)
+        group ->
+          run_dataframe_group_folds(df, group, opts, cv_opts)
+      end
 
     %{folds: folds, stats: stats(folds)}
   end
@@ -138,6 +112,111 @@ defmodule Hinoki.CV do
       end)
 
     %{results: results}
+  end
+
+  defp validate_common_k_fold_opts!(opts) do
+    reject_fold_owned_opts!(opts)
+
+    unless Keyword.has_key?(opts, :early_stopping_rounds) do
+      raise ArgumentError, "Hinoki.CV.k_fold/2 requires :early_stopping_rounds"
+    end
+
+    %{
+      folding_rule: validate_folding_rule!(Keyword.get(opts, :folding_rule, :raw)),
+      seed: validate_seed!(Keyword.get(opts, :seed)),
+      train_opts: train_opts(opts)
+    }
+  end
+
+  defp reject_fold_owned_opts!(opts) do
+    if Keyword.has_key?(opts, :valid) do
+      raise ArgumentError, "Hinoki.CV.k_fold/2 builds validation folds; do not pass :valid"
+    end
+
+    if Keyword.has_key?(opts, :valid_group) do
+      raise ArgumentError,
+            "Hinoki.CV.k_fold/2 builds validation folds; do not pass :valid_group"
+    end
+  end
+
+  defp run_tensor_row_folds(features, labels, nrow, opts, cv_opts) do
+    {k, max_concurrency} = fold_run_settings!(opts, nrow)
+
+    nrow
+    |> fold_indices(k, fn -> tensor_to_list(labels) end, cv_opts.folding_rule, cv_opts.seed)
+    |> run_folds(max_concurrency, fn {train_idx, valid_idx} ->
+      train_input = {take_rows(features, train_idx), take_rows(labels, train_idx)}
+      valid_input = {take_rows(features, valid_idx), take_rows(labels, valid_idx)}
+
+      train_input
+      |> Hinoki.train(Keyword.put(cv_opts.train_opts, :valid, valid_input))
+      |> Hinoki.best()
+    end)
+  end
+
+  defp run_tensor_group_folds(features, labels, group, nrow, opts, cv_opts) do
+    group_blocks = tensor_group_blocks!(group, nrow)
+    {k, max_concurrency} = fold_run_settings!(opts, length(group_blocks))
+
+    group_blocks
+    |> group_fold_blocks(k, cv_opts.folding_rule, cv_opts.seed)
+    |> run_folds(max_concurrency, fn {train_blocks, valid_blocks} ->
+      {train_idx, train_group} = group_fold_payload(train_blocks)
+      {valid_idx, valid_group} = group_fold_payload(valid_blocks)
+      train_input = {take_rows(features, train_idx), take_rows(labels, train_idx)}
+      valid_input = {take_rows(features, valid_idx), take_rows(labels, valid_idx)}
+
+      train_input
+      |> Hinoki.train(
+        cv_opts.train_opts
+        |> Keyword.put(:group, train_group)
+        |> Keyword.put(:valid, valid_input)
+        |> Keyword.put(:valid_group, valid_group)
+      )
+      |> Hinoki.best()
+    end)
+  end
+
+  defp run_dataframe_row_folds(df, nrow, opts, cv_opts) do
+    {k, max_concurrency} = fold_run_settings!(opts, nrow)
+    target = Keyword.fetch!(opts, :target)
+    labels_fun = fn -> df |> Explorer.DataFrame.pull(target) |> Explorer.Series.to_list() end
+
+    nrow
+    |> fold_indices(k, labels_fun, cv_opts.folding_rule, cv_opts.seed)
+    |> run_folds(max_concurrency, fn {train_idx, valid_idx} ->
+      train_df = Explorer.DataFrame.slice(df, train_idx)
+      valid_df = Explorer.DataFrame.slice(df, valid_idx)
+
+      train_df
+      |> Hinoki.train(Keyword.put(cv_opts.train_opts, :valid, valid_df))
+      |> Hinoki.best()
+    end)
+  end
+
+  defp run_dataframe_group_folds(df, group, opts, cv_opts) do
+    group_blocks = dataframe_group_blocks!(df, group)
+    {k, max_concurrency} = fold_run_settings!(opts, length(group_blocks))
+
+    group_blocks
+    |> group_fold_blocks(k, cv_opts.folding_rule, cv_opts.seed)
+    |> run_folds(max_concurrency, fn {train_blocks, valid_blocks} ->
+      train_idx = group_fold_indices(train_blocks)
+      valid_idx = group_fold_indices(valid_blocks)
+      train_df = Explorer.DataFrame.slice(df, train_idx)
+      valid_df = Explorer.DataFrame.slice(df, valid_idx)
+
+      train_df
+      |> Hinoki.train(Keyword.put(cv_opts.train_opts, :valid, valid_df))
+      |> Hinoki.best()
+    end)
+  end
+
+  defp fold_run_settings!(opts, unit_count) do
+    k = validate_k!(Keyword.get(opts, :k, 5), unit_count)
+    max_concurrency = validate_max_concurrency!(Keyword.get(opts, :max_concurrency, 1), k)
+
+    {k, max_concurrency}
   end
 
   defp validate_tensor_input!(features, labels) do
@@ -235,6 +314,136 @@ defmodule Hinoki.CV do
 
       {train_idx, valid_idx}
     end)
+  end
+
+  defp group_fold_blocks(blocks, k, folding_rule, seed) when folding_rule in [:raw, :shuffle] do
+    shuffled_blocks = maybe_shuffle_blocks(blocks, folding_rule, seed)
+
+    length(blocks)
+    |> fold_ranges(k)
+    |> Enum.map(fn {offset, size} ->
+      valid_ordinals =
+        shuffled_blocks
+        |> Enum.slice(offset, size)
+        |> Enum.map(& &1.ordinal)
+        |> MapSet.new()
+
+      valid_blocks = Enum.filter(blocks, &MapSet.member?(valid_ordinals, &1.ordinal))
+      train_blocks = Enum.reject(blocks, &MapSet.member?(valid_ordinals, &1.ordinal))
+
+      {train_blocks, valid_blocks}
+    end)
+  end
+
+  defp group_fold_blocks(_blocks, _k, folding_rule, _seed) do
+    raise ArgumentError,
+          "ranking group cross-validation supports :raw and :shuffle folding rules, got: #{inspect(folding_rule)}"
+  end
+
+  defp maybe_shuffle_blocks(blocks, :raw, _seed), do: blocks
+  defp maybe_shuffle_blocks(blocks, :shuffle, seed), do: shuffle_list(blocks, seed)
+
+  defp group_fold_payload(blocks) do
+    {group_fold_indices(blocks), Enum.map(blocks, & &1.size)}
+  end
+
+  defp group_fold_indices(blocks) do
+    Enum.flat_map(blocks, & &1.indices)
+  end
+
+  defp tensor_group_blocks!(group, nrow) do
+    group = validate_group_sizes!(group, nrow, ":group")
+
+    {blocks, {_offset, _ordinal}} =
+      Enum.map_reduce(group, {0, 0}, fn size, {offset, ordinal} ->
+        indices = Enum.to_list(offset..(offset + size - 1))
+
+        {%{ordinal: ordinal, size: size, indices: indices}, {offset + size, ordinal + 1}}
+      end)
+
+    blocks
+  end
+
+  defp validate_group_sizes!(group, expected_nrow, option) when is_list(group) do
+    if group == [] do
+      raise ArgumentError, "expected #{option} to contain at least one group size"
+    end
+
+    unless Enum.all?(group, &(is_integer(&1) and &1 > 0)) do
+      raise ArgumentError,
+            "expected #{option} to contain only positive integer group sizes, got: #{inspect(group)}"
+    end
+
+    actual_nrow = Enum.sum(group)
+
+    unless actual_nrow == expected_nrow do
+      raise ArgumentError,
+            "#{option} row count #{actual_nrow} does not match row count #{expected_nrow}"
+    end
+
+    group
+  end
+
+  defp validate_group_sizes!(group, _expected_nrow, option) do
+    raise ArgumentError,
+          "expected #{option} to be a list of positive integer group sizes, got: #{inspect(group)}"
+  end
+
+  defp dataframe_group_blocks!(df, group) do
+    group_col = normalize_column_name!(group, ":group")
+    names = Explorer.DataFrame.names(df)
+
+    unless group_col in names do
+      raise ArgumentError,
+            "group column #{inspect(group_col)} not found in DataFrame; available columns: #{inspect(names)}"
+    end
+
+    df
+    |> Explorer.DataFrame.pull(group_col)
+    |> Explorer.Series.to_list()
+    |> contiguous_group_blocks!(group_col)
+  end
+
+  defp normalize_column_name!(column, _option) when is_atom(column), do: to_string(column)
+  defp normalize_column_name!(column, _option) when is_binary(column), do: column
+
+  defp normalize_column_name!(column, option) do
+    raise ArgumentError,
+          "expected #{option} to be a DataFrame column name, got: #{inspect(column)}"
+  end
+
+  defp contiguous_group_blocks!([], group_col) do
+    raise ArgumentError, "group column #{inspect(group_col)} has no rows"
+  end
+
+  defp contiguous_group_blocks!([first | rest], group_col) do
+    {blocks, _current_value, start_idx, current_size, _seen, _idx} =
+      Enum.reduce(rest, {[], first, 0, 1, MapSet.new([first]), 1}, fn value,
+                                                                      {blocks, current_value,
+                                                                       start_idx, current_size,
+                                                                       seen, idx} ->
+        if value == current_value do
+          {blocks, current_value, start_idx, current_size + 1, seen, idx + 1}
+        else
+          if MapSet.member?(seen, value) do
+            raise ArgumentError,
+                  "group column #{inspect(group_col)} must be ordered by contiguous groups; value #{inspect(value)} appears in multiple blocks"
+          end
+
+          block = %{size: current_size, indices: Enum.to_list(start_idx..(idx - 1))}
+          {[block | blocks], value, idx, 1, MapSet.put(seen, value), idx + 1}
+        end
+      end)
+
+    final_block = %{
+      size: current_size,
+      indices: Enum.to_list(start_idx..(start_idx + current_size - 1))
+    }
+
+    [final_block | blocks]
+    |> Enum.reverse()
+    |> Enum.with_index()
+    |> Enum.map(fn {block, ordinal} -> Map.put(block, :ordinal, ordinal) end)
   end
 
   defp stratified_indices(nrow, labels, k, shuffle?, seed) do
