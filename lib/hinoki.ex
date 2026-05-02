@@ -59,9 +59,15 @@ defmodule Hinoki do
     * `:num_iterations` — boosting rounds. Default `#{@default_num_iterations}`.
     * `:params` — keyword/map of LightGBM parameters (e.g. `objective`, `learning_rate`).
     * `:target` — required when input is a `DataFrame`.
+    * `:group` — ranking group sizes for tensor input, or a group column name
+      for DataFrame input. DataFrame group columns are excluded from features
+      and converted to contiguous group sizes.
     * `:valid` — validation data for early stopping. Pass a `{features, labels}`
       tuple or a DataFrame. DataFrame validation uses the same `:target` column
       as training.
+    * `:valid_group` — validation ranking group sizes for tensor input, or a
+      validation group column name for DataFrame input. DataFrame validation
+      defaults to the `:group` column when `:valid_group` is not set.
     * `:early_stopping_rounds` — stop training when the first metric on the
       validation dataset does not improve for this many rounds.
   """
@@ -70,14 +76,18 @@ defmodule Hinoki do
     num_iter = Keyword.get(opts, :num_iterations, @default_num_iterations)
     params = Keyword.get(opts, :params, [])
     target = Keyword.get(opts, :target)
+    group = Keyword.get(opts, :group)
+    valid_group = Keyword.get(opts, :valid_group, default_valid_group(input, group))
     early_stopping_rounds = Keyword.get(opts, :early_stopping_rounds)
 
-    {features_bin, labels_bin, nrow, ncol, categorical_indices} = to_train_payload(input, target)
-    valid_payload = to_valid_payload(Keyword.get(opts, :valid), input, target, ncol)
+    {features_bin, labels_bin, group_bin, nrow, ncol, categorical_indices} =
+      to_train_payload(input, target, group)
+
+    valid_payload = to_valid_payload(Keyword.get(opts, :valid), input, target, valid_group, ncol)
     params = maybe_put_categorical_feature(params, categorical_indices)
     params_bin = encode_params(params)
 
-    dataset_ref = create_dataset!(features_bin, labels_bin, nrow, ncol, params_bin)
+    dataset_ref = create_dataset!(features_bin, labels_bin, group_bin, nrow, ncol, params_bin)
 
     booster_ref = unwrap!(NIF.booster_create(dataset_ref, params_bin))
 
@@ -86,11 +96,12 @@ defmodule Hinoki do
         nil ->
           nil
 
-        {valid_features_bin, valid_labels_bin, valid_nrow, valid_ncol} ->
+        {valid_features_bin, valid_labels_bin, valid_group_bin, valid_nrow, valid_ncol} ->
           ref =
             create_dataset!(
               valid_features_bin,
               valid_labels_bin,
+              valid_group_bin,
               valid_nrow,
               valid_ncol,
               params_bin,
@@ -369,7 +380,15 @@ defmodule Hinoki do
 
   # ---------- input → binary ----------
 
-  defp create_dataset!(features_bin, labels_bin, nrow, ncol, params_bin, reference_ref \\ nil) do
+  defp create_dataset!(
+         features_bin,
+         labels_bin,
+         group_bin,
+         nrow,
+         ncol,
+         params_bin,
+         reference_ref \\ nil
+       ) do
     dataset_ref =
       if is_nil(reference_ref) do
         unwrap!(NIF.dataset_create_from_mat(features_bin, nrow, ncol, params_bin))
@@ -386,6 +405,7 @@ defmodule Hinoki do
       end
 
     unwrap!(NIF.dataset_set_label(dataset_ref, labels_bin))
+    if group_bin, do: unwrap!(NIF.dataset_set_group(dataset_ref, group_bin))
     dataset_ref
   end
 
@@ -467,15 +487,21 @@ defmodule Hinoki do
     }
   end
 
-  defp to_train_payload({%Nx.Tensor{} = features, %Nx.Tensor{} = labels}, _target) do
+  defp default_valid_group(%Explorer.DataFrame{}, group), do: group
+  defp default_valid_group(_input, nil), do: nil
+  defp default_valid_group(_input, _group), do: :__hinoki_missing_valid_group__
+
+  defp to_train_payload({%Nx.Tensor{} = features, %Nx.Tensor{} = labels}, _target, group) do
     {features_bin, nrow, ncol} = tensor_to_features_bin(features)
     labels_bin = labels_tensor_to_bin(labels, nrow)
-    {features_bin, labels_bin, nrow, ncol, []}
+    group_bin = group_to_bin(group, nrow, ":group")
+    {features_bin, labels_bin, group_bin, nrow, ncol, []}
   end
 
-  defp to_train_payload(%Explorer.DataFrame{} = df, target)
+  defp to_train_payload(%Explorer.DataFrame{} = df, target, group)
        when (is_atom(target) and not is_nil(target)) or is_binary(target) do
     target = to_string(target)
+    group_col = normalize_optional_column(group, ":group")
     names = Explorer.DataFrame.names(df)
 
     unless target in names do
@@ -483,17 +509,19 @@ defmodule Hinoki do
             "target column #{inspect(target)} not found in DataFrame; available columns: #{inspect(names)}"
     end
 
-    feature_cols = names -- [target]
+    validate_group_column!(group_col, names)
+    feature_cols = names -- Enum.reject([target, group_col], &is_nil/1)
     dtypes = Explorer.DataFrame.dtypes(df)
 
     if feature_cols == [] do
       raise ArgumentError,
-            "DataFrame has no feature columns after dropping target #{inspect(target)}"
+            "DataFrame has no feature columns after dropping target/group columns"
     end
 
     features = df_columns_to_tensor(df, feature_cols)
     {features_bin, nrow, ncol} = tensor_to_features_bin(features)
     categorical_indices = categorical_feature_indices(feature_cols, dtypes)
+    group_bin = dataframe_group_to_bin(df, group_col, nrow)
 
     labels =
       df
@@ -502,45 +530,72 @@ defmodule Hinoki do
       |> Explorer.Series.to_tensor()
 
     labels_bin = labels_tensor_to_bin(labels, nrow)
-    {features_bin, labels_bin, nrow, ncol, categorical_indices}
+    {features_bin, labels_bin, group_bin, nrow, ncol, categorical_indices}
   end
 
-  defp to_train_payload(%Explorer.DataFrame{}, nil) do
+  defp to_train_payload(%Explorer.DataFrame{}, nil, _group) do
     raise ArgumentError,
           "training from a DataFrame requires the :target option naming the label column"
   end
 
-  defp to_train_payload(other, _target) do
+  defp to_train_payload(other, _target, _group) do
     raise ArgumentError,
           "expected an Explorer.DataFrame or {features, labels} tensor tuple, got: #{inspect(other)}"
   end
 
-  defp to_valid_payload(nil, _train_input, _target, _expected_ncol), do: nil
+  defp to_valid_payload(nil, _train_input, _target, _valid_group, _expected_ncol), do: nil
+
+  defp to_valid_payload(
+         {%Nx.Tensor{}, %Nx.Tensor{}},
+         _train_input,
+         _target,
+         :__hinoki_missing_valid_group__,
+         _expected_ncol
+       ) do
+    raise ArgumentError,
+          ":valid_group is required when tensor validation data is used with training :group"
+  end
 
   defp to_valid_payload(
          {%Nx.Tensor{} = features, %Nx.Tensor{} = labels},
          _train_input,
          _target,
+         valid_group,
          expected_ncol
        ) do
     {features_bin, nrow, ncol} = tensor_to_features_bin(features)
     validate_feature_count!(ncol, expected_ncol, "validation")
     labels_bin = labels_tensor_to_bin(labels, nrow)
-    {features_bin, labels_bin, nrow, ncol}
+    group_bin = group_to_bin(valid_group, nrow, ":valid_group")
+    {features_bin, labels_bin, group_bin, nrow, ncol}
   end
 
-  defp to_valid_payload(%Explorer.DataFrame{} = df, %Explorer.DataFrame{}, target, expected_ncol) do
-    {features_bin, labels_bin, nrow, ncol, _categorical_indices} = to_train_payload(df, target)
+  defp to_valid_payload(
+         %Explorer.DataFrame{} = df,
+         %Explorer.DataFrame{},
+         target,
+         valid_group,
+         expected_ncol
+       ) do
+    {features_bin, labels_bin, group_bin, nrow, ncol, _categorical_indices} =
+      to_train_payload(df, target, valid_group)
+
     validate_feature_count!(ncol, expected_ncol, "validation")
-    {features_bin, labels_bin, nrow, ncol}
+    {features_bin, labels_bin, group_bin, nrow, ncol}
   end
 
-  defp to_valid_payload(%Explorer.DataFrame{}, _train_input, _target, _expected_ncol) do
+  defp to_valid_payload(
+         %Explorer.DataFrame{},
+         _train_input,
+         _target,
+         _valid_group,
+         _expected_ncol
+       ) do
     raise ArgumentError,
           "DataFrame validation data is only supported when training input is a DataFrame"
   end
 
-  defp to_valid_payload(other, _train_input, _target, _expected_ncol) do
+  defp to_valid_payload(other, _train_input, _target, _valid_group, _expected_ncol) do
     raise ArgumentError,
           "expected :valid to be an Explorer.DataFrame or {features, labels} tensor tuple, got: #{inspect(other)}"
   end
@@ -607,6 +662,95 @@ defmodule Hinoki do
         raise ArgumentError,
               "labels tensor shape #{inspect(other)} does not match feature row count {#{expected_nrow}}"
     end
+  end
+
+  defp group_to_bin(nil, _expected_nrow, _option), do: nil
+
+  defp group_to_bin(group, expected_nrow, option) when is_list(group) do
+    validate_group!(group, expected_nrow, option)
+
+    for value <- group, into: <<>> do
+      <<value::signed-native-32>>
+    end
+  end
+
+  defp group_to_bin(group, _expected_nrow, option) do
+    raise ArgumentError,
+          "expected #{option} to be a list of positive integer group sizes, got: #{inspect(group)}"
+  end
+
+  defp validate_group!(group, expected_nrow, option) do
+    if group == [] do
+      raise ArgumentError, "expected #{option} to contain at least one group size"
+    end
+
+    unless Enum.all?(group, &(is_integer(&1) and &1 > 0)) do
+      raise ArgumentError,
+            "expected #{option} to contain only positive integer group sizes, got: #{inspect(group)}"
+    end
+
+    actual_nrow = Enum.sum(group)
+
+    unless actual_nrow == expected_nrow do
+      raise ArgumentError,
+            "#{option} row count #{actual_nrow} does not match feature row count #{expected_nrow}"
+    end
+
+    :ok
+  end
+
+  defp normalize_optional_column(nil, _option), do: nil
+  defp normalize_optional_column(column, _option) when is_atom(column), do: to_string(column)
+  defp normalize_optional_column(column, _option) when is_binary(column), do: column
+
+  defp normalize_optional_column(column, option) do
+    raise ArgumentError,
+          "expected #{option} to be a DataFrame column name, got: #{inspect(column)}"
+  end
+
+  defp validate_group_column!(nil, _names), do: :ok
+
+  defp validate_group_column!(group_col, names) do
+    unless group_col in names do
+      raise ArgumentError,
+            "group column #{inspect(group_col)} not found in DataFrame; available columns: #{inspect(names)}"
+    end
+  end
+
+  defp dataframe_group_to_bin(_df, nil, _nrow), do: nil
+
+  defp dataframe_group_to_bin(df, group_col, nrow) do
+    group =
+      df
+      |> Explorer.DataFrame.pull(group_col)
+      |> Explorer.Series.to_list()
+      |> contiguous_group_sizes!(group_col)
+
+    group_to_bin(group, nrow, ":group")
+  end
+
+  defp contiguous_group_sizes!([], group_col) do
+    raise ArgumentError, "group column #{inspect(group_col)} has no rows"
+  end
+
+  defp contiguous_group_sizes!([first | rest], group_col) do
+    {sizes, _current_value, current_size, _seen} =
+      Enum.reduce(rest, {[], first, 1, MapSet.new([first])}, fn value,
+                                                                {sizes, current_value,
+                                                                 current_size, seen} ->
+        if value == current_value do
+          {sizes, current_value, current_size + 1, seen}
+        else
+          if MapSet.member?(seen, value) do
+            raise ArgumentError,
+                  "group column #{inspect(group_col)} must be ordered by contiguous groups; value #{inspect(value)} appears in multiple blocks"
+          end
+
+          {[current_size | sizes], value, 1, MapSet.put(seen, value)}
+        end
+      end)
+
+    Enum.reverse([current_size | sizes])
   end
 
   defp validate_feature_count!(ncol, ncol, _context), do: :ok

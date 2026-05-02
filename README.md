@@ -85,6 +85,41 @@ Hinoki.current_iteration(booster)
 Hinoki.best(booster)
 ```
 
+## Ranking Groups
+
+Ranking objectives such as `lambdarank` require explicit query/group
+metadata. For tensor input, pass group sizes whose sum equals the row
+count. Validation data uses `:valid_group`.
+
+```elixir
+booster =
+  Hinoki.train({features, labels},
+    group: [16, 18, 12],
+    valid: {valid_features, valid_labels},
+    valid_group: [15, 17],
+    params: [objective: "lambdarank", metric: "ndcg", num_threads: 1, seed: 42]
+  )
+```
+
+For DataFrame input, pass the group column name. Hinoki removes both the
+target and group columns from the feature matrix, converts contiguous
+group values to group sizes, and sets LightGBM's `group` dataset field.
+The DataFrame must already be ordered so each group is one contiguous
+block. Validation DataFrames use the same group column unless
+`:valid_group` names a different one.
+
+```elixir
+booster =
+  Hinoki.train(df,
+    target: :label,
+    group: :group_label,
+    params: [objective: "lambdarank", metric: "ndcg", num_threads: 1, seed: 42]
+  )
+
+features = Explorer.DataFrame.discard(df, ["label", "group_label"])
+preds = Hinoki.predict(booster, features)
+```
+
 ## Cross-Validation
 
 Cross-validation uses each fold's validation data for early stopping.

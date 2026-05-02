@@ -112,6 +112,47 @@ defmodule HinokiTest do
       assert Nx.shape(preds) == {9, 3}
     end
 
+    test "trains lambdarank with explicit group sizes" do
+      features =
+        Nx.tensor(
+          [
+            [0.9, 0.1],
+            [0.4, 0.5],
+            [0.1, 0.9],
+            [0.8, 0.2],
+            [0.3, 0.6],
+            [0.2, 0.8],
+            [0.95, 0.0],
+            [0.5, 0.4],
+            [0.05, 1.0]
+          ],
+          type: :f64
+        )
+
+      labels = Nx.tensor([2, 1, 0, 2, 1, 0, 2, 1, 0], type: :f32)
+
+      booster =
+        Hinoki.train({features, labels},
+          group: [3, 3, 3],
+          valid: {features, labels},
+          valid_group: [3, 3, 3],
+          num_iterations: 10,
+          params: [
+            objective: "lambdarank",
+            metric: "ndcg",
+            learning_rate: 0.2,
+            min_data_in_leaf: 1,
+            num_leaves: 4,
+            num_threads: 1,
+            seed: 42,
+            verbose: -1
+          ]
+        )
+
+      preds = Hinoki.predict(booster, features)
+      assert Nx.shape(preds) == {9}
+    end
+
     test "stops early when validation stops improving" do
       train_features =
         Nx.tensor(
@@ -540,6 +581,39 @@ defmodule HinokiTest do
       assert Hinoki.info(booster, :categorical_features) == [0]
       assert Hinoki.dump(booster) =~ "[categorical_feature: 0]"
     end
+
+    test "uses a group column as ranking metadata instead of a feature" do
+      df =
+        Explorer.DataFrame.new(
+          group_label: ["a", "a", "a", "b", "b", "b", "c", "c", "c"],
+          score: [0.9, 0.4, 0.1, 0.8, 0.3, 0.2, 0.95, 0.5, 0.05],
+          noise: [0.1, 0.5, 0.9, 0.2, 0.6, 0.8, 0.0, 0.4, 1.0],
+          label: [2, 1, 0, 2, 1, 0, 2, 1, 0]
+        )
+
+      booster =
+        Hinoki.train(df,
+          target: :label,
+          group: :group_label,
+          num_iterations: 10,
+          params: [
+            objective: "lambdarank",
+            metric: "ndcg",
+            learning_rate: 0.2,
+            min_data_in_leaf: 1,
+            num_leaves: 4,
+            num_threads: 1,
+            seed: 42,
+            verbose: -1
+          ]
+        )
+
+      features = Explorer.DataFrame.discard(df, ["label", "group_label"])
+      preds = Hinoki.predict(booster, features)
+
+      assert Nx.shape(preds) == {9}
+      assert Hinoki.num_features(booster) == 2
+    end
   end
 
   describe "Hinoki.CV.k_fold/2" do
@@ -954,6 +1028,53 @@ defmodule HinokiTest do
           valid: {valid_features, labels},
           early_stopping_rounds: 5,
           params: TestData.deterministic_params()
+        )
+      end
+    end
+
+    test "group row count must match features" do
+      {features, labels} = TestData.binary_xor_like(5)
+
+      assert_raise ArgumentError,
+                   ~r/:group row count 9 does not match feature row count 10/,
+                   fn ->
+                     Hinoki.train({features, labels},
+                       group: [4, 5],
+                       params: [
+                         objective: "lambdarank",
+                         metric: "ndcg",
+                         num_threads: 1,
+                         verbose: -1
+                       ]
+                     )
+                   end
+    end
+
+    test "tensor validation with training group requires explicit valid_group" do
+      {features, labels} = TestData.binary_xor_like(5)
+
+      assert_raise ArgumentError, ~r/:valid_group is required/, fn ->
+        Hinoki.train({features, labels},
+          group: [5, 5],
+          valid: {features, labels},
+          params: [objective: "lambdarank", metric: "ndcg", num_threads: 1, verbose: -1]
+        )
+      end
+    end
+
+    test "DataFrame group column must be contiguous" do
+      df =
+        Explorer.DataFrame.new(
+          group_label: ["a", "a", "b", "b", "a"],
+          score: [0.9, 0.4, 0.8, 0.3, 0.1],
+          label: [2, 1, 2, 1, 0]
+        )
+
+      assert_raise ArgumentError, ~r/must be ordered by contiguous groups/, fn ->
+        Hinoki.train(df,
+          target: :label,
+          group: :group_label,
+          params: [objective: "lambdarank", metric: "ndcg", num_threads: 1, verbose: -1]
         )
       end
     end

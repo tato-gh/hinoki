@@ -262,6 +262,25 @@ static ERL_NIF_TERM nif_dataset_set_label(ErlNifEnv *env, int argc,
     return mk_atom(env, "ok");
 }
 
+// dataset_set_group(dataset, group_bin)
+//   group_bin: Int32 group sizes, length = number of groups * 4
+static ERL_NIF_TERM nif_dataset_set_group(ErlNifEnv *env, int argc,
+                                          const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    HinokiDataset *d;
+    ErlNifBinary group;
+    if (!enif_get_resource(env, argv[0], HINOKI_DATASET_RES, (void **)&d))
+        return enif_make_badarg(env);
+    if (!enif_inspect_binary(env, argv[1], &group))
+        return enif_make_badarg(env);
+
+    int group_count = (int)(group.size / sizeof(int32_t));
+    int rc = LGBM_DatasetSetField(d->handle, "group", group.data, group_count,
+                                  C_API_DTYPE_INT32);
+    if (rc != 0) return mk_lgbm_error(env);
+    return mk_atom(env, "ok");
+}
+
 // booster_create(dataset, params_bin)
 static ERL_NIF_TERM nif_booster_create(ErlNifEnv *env, int argc,
                                        const ERL_NIF_TERM argv[]) {
@@ -600,6 +619,8 @@ static ErlNifFunc nif_funcs[] = {
     {"dataset_create_from_mat_reference", 5,
      nif_dataset_create_from_mat_reference, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"dataset_set_label", 2, nif_dataset_set_label,
+     ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"dataset_set_group", 2, nif_dataset_set_group,
      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"booster_create", 2, nif_booster_create, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"booster_add_valid_data", 2, nif_booster_add_valid_data,
