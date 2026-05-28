@@ -44,6 +44,7 @@ defmodule Hinoki do
   alias Hinoki.{Booster, NIF}
 
   @default_num_iterations 100
+  @max_float 1.7976931348623157e308
 
   @doc """
   Train a LightGBM booster.
@@ -59,12 +60,18 @@ defmodule Hinoki do
     * `:num_iterations` — boosting rounds. Default `#{@default_num_iterations}`.
     * `:params` — keyword/map of LightGBM parameters (e.g. `objective`, `learning_rate`).
     * `:target` — required when input is a `DataFrame`.
+    * `:weight` — row weights for tensor input, or a weight column name for
+      DataFrame input. DataFrame weight columns are excluded from features.
     * `:group` — ranking group sizes for tensor input, or a group column name
       for DataFrame input. DataFrame group columns are excluded from features
       and converted to contiguous group sizes.
     * `:valid` — validation data for early stopping. Pass a `{features, labels}`
       tuple or a DataFrame. DataFrame validation uses the same `:target` column
       as training.
+    * `:valid_weight` — validation row weights for tensor input, or a validation
+      weight column name for DataFrame input. DataFrame validation defaults to
+      the `:weight` column when `:valid_weight` is not set. Pass `nil` to
+      keep validation data unweighted.
     * `:valid_group` — validation ranking group sizes for tensor input, or a
       validation group column name for DataFrame input. DataFrame validation
       defaults to the `:group` column when `:valid_group` is not set.
@@ -76,18 +83,23 @@ defmodule Hinoki do
     num_iter = Keyword.get(opts, :num_iterations, @default_num_iterations)
     params = Keyword.get(opts, :params, [])
     target = Keyword.get(opts, :target)
+    weight = Keyword.get(opts, :weight)
     group = Keyword.get(opts, :group)
+    valid_weight = Keyword.get(opts, :valid_weight, default_valid_weight(input, weight))
     valid_group = Keyword.get(opts, :valid_group, default_valid_group(input, group))
     early_stopping_rounds = Keyword.get(opts, :early_stopping_rounds)
 
-    {features_bin, labels_bin, group_bin, nrow, ncol, categorical_indices} =
-      to_train_payload(input, target, group)
+    {features_bin, labels_bin, weight_bin, group_bin, nrow, ncol, categorical_indices} =
+      to_train_payload(input, target, group, weight)
 
-    valid_payload = to_valid_payload(Keyword.get(opts, :valid), input, target, valid_group, ncol)
+    valid_payload =
+      to_valid_payload(Keyword.get(opts, :valid), input, target, valid_group, valid_weight, ncol)
+
     params = maybe_put_categorical_feature(params, categorical_indices)
     params_bin = encode_params(params)
 
-    dataset_ref = create_dataset!(features_bin, labels_bin, group_bin, nrow, ncol, params_bin)
+    dataset_ref =
+      create_dataset!(features_bin, labels_bin, weight_bin, group_bin, nrow, ncol, params_bin)
 
     booster_ref = unwrap!(NIF.booster_create(dataset_ref, params_bin))
 
@@ -96,11 +108,13 @@ defmodule Hinoki do
         nil ->
           nil
 
-        {valid_features_bin, valid_labels_bin, valid_group_bin, valid_nrow, valid_ncol} ->
+        {valid_features_bin, valid_labels_bin, valid_weight_bin, valid_group_bin, valid_nrow,
+         valid_ncol} ->
           ref =
             create_dataset!(
               valid_features_bin,
               valid_labels_bin,
+              valid_weight_bin,
               valid_group_bin,
               valid_nrow,
               valid_ncol,
@@ -383,6 +397,7 @@ defmodule Hinoki do
   defp create_dataset!(
          features_bin,
          labels_bin,
+         weight_bin,
          group_bin,
          nrow,
          ncol,
@@ -405,6 +420,7 @@ defmodule Hinoki do
       end
 
     unwrap!(NIF.dataset_set_label(dataset_ref, labels_bin))
+    if weight_bin, do: unwrap!(NIF.dataset_set_weight(dataset_ref, weight_bin))
     if group_bin, do: unwrap!(NIF.dataset_set_group(dataset_ref, group_bin))
     dataset_ref
   end
@@ -491,17 +507,22 @@ defmodule Hinoki do
   defp default_valid_group(_input, nil), do: nil
   defp default_valid_group(_input, _group), do: :__hinoki_missing_valid_group__
 
-  defp to_train_payload({%Nx.Tensor{} = features, %Nx.Tensor{} = labels}, _target, group) do
+  defp default_valid_weight(%Explorer.DataFrame{}, weight), do: weight
+  defp default_valid_weight(_input, _weight), do: nil
+
+  defp to_train_payload({%Nx.Tensor{} = features, %Nx.Tensor{} = labels}, _target, group, weight) do
     {features_bin, nrow, ncol} = tensor_to_features_bin(features)
     labels_bin = labels_tensor_to_bin(labels, nrow)
+    weight_bin = weight_to_bin(weight, nrow, ":weight")
     group_bin = group_to_bin(group, nrow, ":group")
-    {features_bin, labels_bin, group_bin, nrow, ncol, []}
+    {features_bin, labels_bin, weight_bin, group_bin, nrow, ncol, []}
   end
 
-  defp to_train_payload(%Explorer.DataFrame{} = df, target, group)
+  defp to_train_payload(%Explorer.DataFrame{} = df, target, group, weight)
        when (is_atom(target) and not is_nil(target)) or is_binary(target) do
     target = to_string(target)
     group_col = normalize_optional_column(group, ":group")
+    weight_col = normalize_optional_column(weight, ":weight")
     names = Explorer.DataFrame.names(df)
 
     unless target in names do
@@ -510,17 +531,19 @@ defmodule Hinoki do
     end
 
     validate_group_column!(group_col, names)
-    feature_cols = names -- Enum.reject([target, group_col], &is_nil/1)
+    validate_weight_column!(weight_col, names)
+    feature_cols = names -- Enum.reject([target, group_col, weight_col], &is_nil/1)
     dtypes = Explorer.DataFrame.dtypes(df)
 
     if feature_cols == [] do
       raise ArgumentError,
-            "DataFrame has no feature columns after dropping target/group columns"
+            "DataFrame has no feature columns after dropping target/group/weight columns"
     end
 
     features = df_columns_to_tensor(df, feature_cols)
     {features_bin, nrow, ncol} = tensor_to_features_bin(features)
     categorical_indices = categorical_feature_indices(feature_cols, dtypes)
+    weight_bin = dataframe_weight_to_bin(df, weight_col, nrow, ":weight")
     group_bin = dataframe_group_to_bin(df, group_col, nrow)
 
     labels =
@@ -530,26 +553,28 @@ defmodule Hinoki do
       |> Explorer.Series.to_tensor()
 
     labels_bin = labels_tensor_to_bin(labels, nrow)
-    {features_bin, labels_bin, group_bin, nrow, ncol, categorical_indices}
+    {features_bin, labels_bin, weight_bin, group_bin, nrow, ncol, categorical_indices}
   end
 
-  defp to_train_payload(%Explorer.DataFrame{}, nil, _group) do
+  defp to_train_payload(%Explorer.DataFrame{}, nil, _group, _weight) do
     raise ArgumentError,
           "training from a DataFrame requires the :target option naming the label column"
   end
 
-  defp to_train_payload(other, _target, _group) do
+  defp to_train_payload(other, _target, _group, _weight) do
     raise ArgumentError,
           "expected an Explorer.DataFrame or {features, labels} tensor tuple, got: #{inspect(other)}"
   end
 
-  defp to_valid_payload(nil, _train_input, _target, _valid_group, _expected_ncol), do: nil
+  defp to_valid_payload(nil, _train_input, _target, _valid_group, _valid_weight, _expected_ncol),
+    do: nil
 
   defp to_valid_payload(
          {%Nx.Tensor{}, %Nx.Tensor{}},
          _train_input,
          _target,
          :__hinoki_missing_valid_group__,
+         _valid_weight,
          _expected_ncol
        ) do
     raise ArgumentError,
@@ -561,13 +586,15 @@ defmodule Hinoki do
          _train_input,
          _target,
          valid_group,
+         valid_weight,
          expected_ncol
        ) do
     {features_bin, nrow, ncol} = tensor_to_features_bin(features)
     validate_feature_count!(ncol, expected_ncol, "validation")
     labels_bin = labels_tensor_to_bin(labels, nrow)
+    weight_bin = weight_to_bin(valid_weight, nrow, ":valid_weight")
     group_bin = group_to_bin(valid_group, nrow, ":valid_group")
-    {features_bin, labels_bin, group_bin, nrow, ncol}
+    {features_bin, labels_bin, weight_bin, group_bin, nrow, ncol}
   end
 
   defp to_valid_payload(
@@ -575,13 +602,14 @@ defmodule Hinoki do
          %Explorer.DataFrame{},
          target,
          valid_group,
+         valid_weight,
          expected_ncol
        ) do
-    {features_bin, labels_bin, group_bin, nrow, ncol, _categorical_indices} =
-      to_train_payload(df, target, valid_group)
+    {features_bin, labels_bin, weight_bin, group_bin, nrow, ncol, _categorical_indices} =
+      to_train_payload(df, target, valid_group, valid_weight)
 
     validate_feature_count!(ncol, expected_ncol, "validation")
-    {features_bin, labels_bin, group_bin, nrow, ncol}
+    {features_bin, labels_bin, weight_bin, group_bin, nrow, ncol}
   end
 
   defp to_valid_payload(
@@ -589,13 +617,14 @@ defmodule Hinoki do
          _train_input,
          _target,
          _valid_group,
+         _valid_weight,
          _expected_ncol
        ) do
     raise ArgumentError,
           "DataFrame validation data is only supported when training input is a DataFrame"
   end
 
-  defp to_valid_payload(other, _train_input, _target, _valid_group, _expected_ncol) do
+  defp to_valid_payload(other, _train_input, _target, _valid_group, _valid_weight, _expected_ncol) do
     raise ArgumentError,
           "expected :valid to be an Explorer.DataFrame or {features, labels} tensor tuple, got: #{inspect(other)}"
   end
@@ -664,6 +693,77 @@ defmodule Hinoki do
     end
   end
 
+  defp weight_to_bin(nil, _expected_nrow, _option), do: nil
+
+  defp weight_to_bin(%Nx.Tensor{} = t, expected_nrow, option) do
+    weight_tensor_to_bin(t, expected_nrow, option)
+  end
+
+  defp weight_to_bin(weight, expected_nrow, option) when is_list(weight) do
+    validate_weight_list!(weight, expected_nrow, option)
+
+    weight
+    |> Nx.tensor(type: :f32)
+    |> weight_tensor_to_bin(expected_nrow, option)
+  end
+
+  defp weight_to_bin(weight, _expected_nrow, option) do
+    raise ArgumentError,
+          "expected #{option} to be a 1D Nx.Tensor or list of non-negative row weights, got: #{inspect(weight)}"
+  end
+
+  defp weight_tensor_to_bin(%Nx.Tensor{} = t, expected_nrow, option) do
+    case Nx.shape(t) do
+      {^expected_nrow} ->
+        validate_weight_tensor!(t, option)
+        t |> Nx.as_type(:f32) |> Nx.to_binary()
+
+      other ->
+        raise ArgumentError,
+              "#{option} tensor shape #{inspect(other)} does not match feature row count {#{expected_nrow}}"
+    end
+  end
+
+  defp validate_weight_list!(weight, expected_nrow, option) do
+    actual_nrow = length(weight)
+
+    unless actual_nrow == expected_nrow do
+      raise ArgumentError,
+            "#{option} length #{actual_nrow} does not match feature row count #{expected_nrow}"
+    end
+
+    unless Enum.all?(weight, &finite_non_negative_number?/1) do
+      raise ArgumentError,
+            "expected #{option} to contain only finite non-negative row weights, got: #{inspect(weight)}"
+    end
+
+    unless Enum.any?(weight, &(&1 > 0)) do
+      raise ArgumentError, "expected #{option} to contain at least one positive row weight"
+    end
+
+    :ok
+  end
+
+  defp validate_weight_tensor!(%Nx.Tensor{} = t, option) do
+    if tensor_any?(Nx.is_nan(t)) or tensor_any?(Nx.is_infinity(t)) or tensor_any?(Nx.less(t, 0)) do
+      raise ArgumentError, "expected #{option} to contain only finite non-negative row weights"
+    end
+
+    unless t |> Nx.greater(0) |> tensor_any?() do
+      raise ArgumentError, "expected #{option} to contain at least one positive row weight"
+    end
+
+    :ok
+  end
+
+  defp tensor_any?(%Nx.Tensor{} = t), do: t |> Nx.any() |> Nx.to_number() != 0
+
+  defp finite_non_negative_number?(value) when is_number(value) do
+    value >= 0 and value <= @max_float
+  end
+
+  defp finite_non_negative_number?(_value), do: false
+
   defp group_to_bin(nil, _expected_nrow, _option), do: nil
 
   defp group_to_bin(group, expected_nrow, option) when is_list(group) do
@@ -715,6 +815,25 @@ defmodule Hinoki do
       raise ArgumentError,
             "group column #{inspect(group_col)} not found in DataFrame; available columns: #{inspect(names)}"
     end
+  end
+
+  defp validate_weight_column!(nil, _names), do: :ok
+
+  defp validate_weight_column!(weight_col, names) do
+    unless weight_col in names do
+      raise ArgumentError,
+            "weight column #{inspect(weight_col)} not found in DataFrame; available columns: #{inspect(names)}"
+    end
+  end
+
+  defp dataframe_weight_to_bin(_df, nil, _nrow, _option), do: nil
+
+  defp dataframe_weight_to_bin(df, weight_col, nrow, option) do
+    df
+    |> Explorer.DataFrame.pull(weight_col)
+    |> Explorer.Series.cast({:f, 32})
+    |> Explorer.Series.to_tensor()
+    |> weight_tensor_to_bin(nrow, option)
   end
 
   defp dataframe_group_to_bin(_df, nil, _nrow), do: nil

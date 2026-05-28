@@ -22,6 +22,9 @@ defmodule Hinoki.NIF do
   def dataset_set_group(_dataset_ref, _group_bin),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  def dataset_set_weight(_dataset_ref, _weights_bin),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def booster_create(_dataset_ref, _params_bin),
     do: :erlang.nif_error(:nif_not_loaded)
 

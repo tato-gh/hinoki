@@ -44,6 +44,31 @@ LightGBM as categorical features automatically. Tensor input has no
 column dtype metadata, so pass `categorical_feature` in `:params` when
 using `Nx.Tensor` features.
 
+## Row Weights
+
+Pass `:weight` to set per-row LightGBM weights. For tensor input, use a
+1D tensor or list with one non-negative weight per row. For DataFrame
+input, pass the weight column name; Hinoki removes that column from the
+feature matrix.
+
+```elixir
+Hinoki.train({features, labels},
+  weight: weights,
+  params: [objective: "regression", num_threads: 1, seed: 42]
+)
+
+Hinoki.train(df,
+  target: :label,
+  weight: :sample_weight,
+  params: [objective: "regression", num_threads: 1, seed: 42]
+)
+```
+
+Validation data can use `:valid_weight`. DataFrame validation defaults
+to the same weight column as training; pass `:valid_weight` when the
+validation DataFrame uses a different weight column, or pass
+`valid_weight: nil` to keep validation unweighted.
+
 ## Introspection and Importance
 
 ```elixir
@@ -184,7 +209,8 @@ Hinoki.best(loaded)
 ## Notes
 
 - `Hinoki.CV.k_fold/2` requires `:early_stopping_rounds` and builds each
-  fold's validation data internally. Do not pass `:valid` or `:valid_group`.
+  fold's validation data internally. Do not pass `:valid`, `:valid_group`,
+  or `:valid_weight`.
 - Grouped `Hinoki.CV.k_fold/2` supports `:raw` and `:shuffle` folding rules.
   Stratified folding is row-label based and is not supported for ranking
   groups.

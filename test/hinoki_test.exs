@@ -77,6 +77,35 @@ defmodule HinokiTest do
       assert mse < 0.1
     end
 
+    test "uses row weights during training" do
+      features = Nx.tensor([[0.0], [0.0], [1.0], [1.0]], type: :f64)
+      labels = Nx.tensor([0.0, 100.0, 1.0, 1.0], type: :f32)
+
+      booster =
+        Hinoki.train({features, labels},
+          weight: [1.0, 0.0, 1.0, 1.0],
+          num_iterations: 1,
+          params: [
+            objective: "regression",
+            learning_rate: 1.0,
+            boost_from_average: false,
+            min_data_in_bin: 1,
+            min_data_in_leaf: 1,
+            num_leaves: 2,
+            num_threads: 1,
+            seed: 42,
+            verbose: -1
+          ]
+        )
+
+      preds = booster |> Hinoki.predict(features) |> Nx.to_flat_list()
+
+      assert Enum.at(preds, 0) < 1.0
+      assert Enum.at(preds, 1) < 1.0
+      assert Enum.at(preds, 2) > 0.5
+      assert Enum.at(preds, 3) > 0.5
+    end
+
     test "returns a class column for each multiclass class" do
       features =
         Nx.tensor(
@@ -554,6 +583,39 @@ defmodule HinokiTest do
       assert Nx.shape(preds) == {6}
     end
 
+    test "uses a weight column and defaults validation weight to the same column" do
+      df =
+        Explorer.DataFrame.new(
+          x: [0.0, 0.0, 1.0, 1.0],
+          w: [1.0, 0.0, 1.0, 1.0],
+          y: [0.0, 100.0, 1.0, 1.0]
+        )
+
+      booster =
+        Hinoki.train(df,
+          target: :y,
+          weight: :w,
+          valid: df,
+          early_stopping_rounds: 2,
+          num_iterations: 3,
+          params: [
+            objective: "regression",
+            metric: "l2",
+            learning_rate: 1.0,
+            boost_from_average: false,
+            min_data_in_bin: 1,
+            min_data_in_leaf: 1,
+            num_leaves: 2,
+            num_threads: 1,
+            seed: 42,
+            verbose: -1
+          ]
+        )
+
+      assert Hinoki.num_features(booster) == 1
+      assert %{metric: "l2"} = Hinoki.best(booster)
+    end
+
     test "marks category columns as LightGBM categorical features" do
       df =
         Explorer.DataFrame.new(
@@ -639,6 +701,7 @@ defmodule HinokiTest do
       result =
         Hinoki.CV.k_fold({features, labels},
           k: 3,
+          weight: Nx.broadcast(1.0, {60}),
           max_concurrency: 2,
           early_stopping_rounds: 5,
           num_iterations: 40,
@@ -873,6 +936,15 @@ defmodule HinokiTest do
           k: 2,
           early_stopping_rounds: 2,
           params: [objective: "lambdarank", metric: "ndcg", num_threads: 1, verbose: -1]
+        )
+      end
+
+      assert_raise ArgumentError, ~r/do not pass :valid_weight/, fn ->
+        Hinoki.CV.k_fold({features, labels},
+          valid_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+          k: 2,
+          early_stopping_rounds: 2,
+          params: TestData.deterministic_params()
         )
       end
 
@@ -1198,6 +1270,49 @@ defmodule HinokiTest do
         Hinoki.train({features, labels},
           valid: {valid_features, labels},
           early_stopping_rounds: 5,
+          params: TestData.deterministic_params()
+        )
+      end
+    end
+
+    test "weight row count must match features" do
+      {features, labels} = TestData.binary_xor_like(5)
+
+      assert_raise ArgumentError,
+                   ~r/:weight length 9 does not match feature row count 10/,
+                   fn ->
+                     Hinoki.train({features, labels},
+                       weight: List.duplicate(1.0, 9),
+                       params: TestData.deterministic_params()
+                     )
+                   end
+    end
+
+    test "weights must be finite and non-negative" do
+      {features, labels} = TestData.binary_xor_like(5)
+
+      assert_raise ArgumentError, ~r/finite non-negative row weights/, fn ->
+        Hinoki.train({features, labels},
+          weight: [1.0, -1.0 | List.duplicate(1.0, 8)],
+          params: TestData.deterministic_params()
+        )
+      end
+
+      assert_raise ArgumentError, ~r/at least one positive row weight/, fn ->
+        Hinoki.train({features, labels},
+          weight: Nx.broadcast(0.0, {10}),
+          params: TestData.deterministic_params()
+        )
+      end
+    end
+
+    test "DataFrame weight column must exist" do
+      df = Explorer.DataFrame.new(x: [1.0, 2.0], y: [0.0, 1.0])
+
+      assert_raise ArgumentError, ~r/weight column "w" not found/, fn ->
+        Hinoki.train(df,
+          target: :y,
+          weight: :w,
           params: TestData.deterministic_params()
         )
       end

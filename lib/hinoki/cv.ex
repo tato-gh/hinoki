@@ -28,9 +28,13 @@ defmodule Hinoki.CV do
     * `:max_concurrency` - max number of folds to run concurrently. Defaults to `1`.
     * `:early_stopping_rounds` - required.
     * `:target` - required when input is an `Explorer.DataFrame`.
+    * `:weight` - row weights for tensor input, or a weight column name for
+      DataFrame input. Tensor weights are sliced per fold. DataFrame validation
+      folds use the same weight column by default.
     * `:group` - ranking group sizes for tensor input, or a group column name
       for DataFrame input. Grouped cross-validation splits by group.
-    * `:valid` and `:valid_group` are built internally and must not be passed.
+    * `:valid`, `:valid_group`, and `:valid_weight` are built internally and
+      must not be passed.
     * all other options are forwarded to `Hinoki.train/2`.
   """
   @spec k_fold({Nx.Tensor.t(), Nx.Tensor.t()} | Explorer.DataFrame.t(), keyword()) :: cv_result()
@@ -137,10 +141,16 @@ defmodule Hinoki.CV do
       raise ArgumentError,
             "Hinoki.CV.k_fold/2 builds validation folds; do not pass :valid_group"
     end
+
+    if Keyword.has_key?(opts, :valid_weight) do
+      raise ArgumentError,
+            "Hinoki.CV.k_fold/2 builds validation folds; do not pass :valid_weight"
+    end
   end
 
   defp run_tensor_row_folds(features, labels, nrow, opts, cv_opts) do
     {k, max_concurrency} = fold_run_settings!(opts, nrow)
+    weight = tensor_weight_for_folds!(Keyword.get(opts, :weight), nrow)
 
     nrow
     |> fold_indices(k, fn -> tensor_to_list(labels) end, cv_opts.folding_rule, cv_opts.seed)
@@ -149,7 +159,13 @@ defmodule Hinoki.CV do
       valid_input = {take_rows(features, valid_idx), take_rows(labels, valid_idx)}
 
       train_input
-      |> Hinoki.train(Keyword.put(cv_opts.train_opts, :valid, valid_input))
+      |> Hinoki.train(
+        cv_opts.train_opts
+        |> Keyword.delete(:weight)
+        |> maybe_put_fold_weight(:weight, weight, train_idx)
+        |> Keyword.put(:valid, valid_input)
+        |> maybe_put_fold_weight(:valid_weight, weight, valid_idx)
+      )
       |> Hinoki.best()
     end)
   end
@@ -157,6 +173,7 @@ defmodule Hinoki.CV do
   defp run_tensor_group_folds(features, labels, group, nrow, opts, cv_opts) do
     group_blocks = tensor_group_blocks!(group, nrow)
     {k, max_concurrency} = fold_run_settings!(opts, length(group_blocks))
+    weight = tensor_weight_for_folds!(Keyword.get(opts, :weight), nrow)
 
     group_blocks
     |> group_fold_blocks(k, cv_opts.folding_rule, cv_opts.seed)
@@ -169,8 +186,11 @@ defmodule Hinoki.CV do
       train_input
       |> Hinoki.train(
         cv_opts.train_opts
+        |> Keyword.delete(:weight)
+        |> maybe_put_fold_weight(:weight, weight, train_idx)
         |> Keyword.put(:group, train_group)
         |> Keyword.put(:valid, valid_input)
+        |> maybe_put_fold_weight(:valid_weight, weight, valid_idx)
         |> Keyword.put(:valid_group, valid_group)
       )
       |> Hinoki.best()
@@ -228,6 +248,36 @@ defmodule Hinoki.CV do
         raise ArgumentError,
               "expected features shape {nrow, ncol} and labels shape {nrow}, got: #{inspect(feature_shape)} and #{inspect(label_shape)}"
     end
+  end
+
+  defp tensor_weight_for_folds!(nil, _nrow), do: nil
+
+  defp tensor_weight_for_folds!(%Nx.Tensor{} = weight, nrow) do
+    case Nx.shape(weight) do
+      {^nrow} ->
+        weight
+
+      shape ->
+        raise ArgumentError,
+              ":weight tensor shape #{inspect(shape)} does not match row count {#{nrow}}"
+    end
+  end
+
+  defp tensor_weight_for_folds!(weight, nrow) when is_list(weight) do
+    weight
+    |> Nx.tensor(type: :f32)
+    |> tensor_weight_for_folds!(nrow)
+  end
+
+  defp tensor_weight_for_folds!(weight, _nrow) do
+    raise ArgumentError,
+          "expected :weight to be a 1D Nx.Tensor or list of row weights, got: #{inspect(weight)}"
+  end
+
+  defp maybe_put_fold_weight(opts, _key, nil, _indices), do: opts
+
+  defp maybe_put_fold_weight(opts, key, %Nx.Tensor{} = weight, indices) do
+    Keyword.put(opts, key, take_rows(weight, indices))
   end
 
   defp validate_k!(k, nrow) when is_integer(k) and k >= 2 and k <= nrow, do: k
